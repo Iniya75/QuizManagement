@@ -100,6 +100,11 @@ service cloud.firestore {
       match /participants/{participantId} {
         allow read, write: if true;
       }
+
+      // Answers subcollection — students submit live answers, host & students can read
+      match /answers/{answerId} {
+        allow read, write: if true;
+      }
     }
 
     match /competitionHistory/{historyId} {

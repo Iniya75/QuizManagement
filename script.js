@@ -3433,22 +3433,81 @@ function generateCompetitionCode() {
 }
 
 /**
+ * Safely normalize any question format into Kahoot-style:
+ * { question: string, options: [string, string, string, string], answer: number (0..3) }
+ */
+function normalizeLiveQuestion(q) {
+    if (!q) return null;
+
+    const questionText = (q.question || q.title || q.text || q.prompt || "Question").toString().trim();
+
+    let rawOptions = [];
+    if (Array.isArray(q.options)) {
+        rawOptions = q.options;
+    } else if (q.options && typeof q.options === "object") {
+        rawOptions = [q.options.a || q.options[0], q.options.b || q.options[1], q.options.c || q.options[2], q.options.d || q.options[3]];
+    } else if (q.answers && typeof q.answers === "object") {
+        rawOptions = [q.answers.answer_a, q.answers.answer_b, q.answers.answer_c, q.answers.answer_d];
+    }
+
+    const options = [];
+    for (let i = 0; i < 4; i++) {
+        const val = rawOptions[i];
+        if (typeof val === "object" && val !== null) {
+            options.push((val.text || val.option || `Option ${String.fromCharCode(65 + i)}`).toString().trim());
+        } else if (val !== undefined && val !== null && String(val).trim() !== "") {
+            options.push(String(val).trim());
+        } else {
+            options.push(`Option ${String.fromCharCode(65 + i)}`);
+        }
+    }
+
+    let answerIndex = 0;
+    if (typeof q.answer === "number" && q.answer >= 0 && q.answer <= 3) {
+        answerIndex = q.answer;
+    } else if (typeof q.answer === "string") {
+        const trimmed = q.answer.trim();
+        if (/^[0-3]$/.test(trimmed)) {
+            answerIndex = parseInt(trimmed, 10);
+        } else if (/^[A-Da-d]$/.test(trimmed)) {
+            answerIndex = trimmed.toUpperCase().charCodeAt(0) - 65;
+        } else {
+            const foundIdx = options.findIndex(opt => opt.toLowerCase() === trimmed.toLowerCase());
+            if (foundIdx !== -1) answerIndex = foundIdx;
+        }
+    } else if (typeof q.correctAnswer === "number" || typeof q.correct_answer === "number") {
+        answerIndex = parseInt(q.correctAnswer || q.correct_answer, 10) || 0;
+    } else if (typeof q.correctAnswer === "string" || typeof q.correct_answer === "string") {
+        const ca = (q.correctAnswer || q.correct_answer).trim();
+        if (/^[0-3]$/.test(ca)) {
+            answerIndex = parseInt(ca, 10);
+        } else if (/^[A-Da-d]$/.test(ca)) {
+            answerIndex = ca.toUpperCase().charCodeAt(0) - 65;
+        } else {
+            const foundIdx = options.findIndex(opt => opt.toLowerCase() === ca.toLowerCase());
+            if (foundIdx !== -1) answerIndex = foundIdx;
+        }
+    }
+
+    if (answerIndex < 0 || answerIndex > 3 || isNaN(answerIndex)) {
+        answerIndex = 0;
+    }
+
+    return {
+        question: questionText,
+        options: options,
+        answer: answerIndex
+    };
+}
+
+/**
  * Sanitize questions array for Firestore:
  * - removes undefined/null values from options
  * - ensures answer index is a number
  * - returns a plain serializable array
  */
 function sanitizeQuestionsForFirestore(questions) {
-    return (questions || []).map(q => ({
-        question: (q.question || "").toString(),
-        options: [
-            (q.options[0] || "").toString(),
-            (q.options[1] || "").toString(),
-            (q.options[2] || "").toString(),
-            (q.options[3] || "").toString()
-        ],
-        answer: parseInt(q.answer, 10) || 0
-    }));
+    return (questions || []).map(normalizeLiveQuestion).filter(Boolean);
 }
 
 async function launchCompetitionLobby() {
@@ -3474,17 +3533,21 @@ async function launchCompetitionLobby() {
     const competitionData = {
         competitionCode: code,
         code: code,
+        title: `${subject} Live Battle`,
+        subject: subject,
         competitionType: "auto",
         createdBy: creatorName,
         teacherId: currentTeacher ? (currentTeacher.teacherId || currentTeacher.uid || "TEACHER-01") : "TEACHER-01",
         teacherName: currentTeacher ? currentTeacher.name : creatorName,
-        subject: subject,
-        status: "waiting",
+        status: "active",
+        phase: "waiting",
         temporaryQuestions: sanitizedQuestions,
         questions: sanitizedQuestions,
         totalQuestions: count,
         currentQuestionIndex: 0,
         questionStartTime: null,
+        questionStartedAt: null,
+        questionEndedAt: null,
         questionDuration: 60,
         participantCount: 0,
         participants: {},
@@ -3744,8 +3807,6 @@ function handleIncomingLiveEvent(event) {
             handleShowResultStudent(event);
         } else if (event.type === "SHOW_LEADERBOARD") {
             handleShowLeaderboardStudent(event);
-        } else if (event.type === "SHOW_PODIUM") {
-            handleShowPodiumStudent(event);
         } else if (event.type === "COMPETITION_CANCELLED") {
             alert("The host has ended this live competition.");
             exitStudentLiveQuiz();
@@ -3756,7 +3817,7 @@ function handleIncomingLiveEvent(event) {
 function attachHostCompetitionListeners(code) {
     cleanupActiveHostListeners();
 
-    if (typeof db !== "undefined") {
+    if (typeof db !== "undefined" && db) {
         // Real-time listener on participants subcollection
         teacherUnsubParticipants = db.collection("liveCompetitions")
             .doc(code)
@@ -3773,7 +3834,30 @@ function attachHostCompetitionListeners(code) {
                     updateHostParticipantsUI();
                 }
             }, (err) => {
-                console.warn("Host participants listener warning:", err);
+                console.warn("[SKQ Host] Participants listener error:", err);
+            });
+
+        // Real-time listener on answers subcollection for cross-device updates
+        teacherUnsubAnswers = db.collection("liveCompetitions")
+            .doc(code)
+            .collection("answers")
+            .onSnapshot((snapshot) => {
+                if (!activeHostCompetition) return;
+                snapshot.docChanges().forEach(change => {
+                    if (change.type === "added") {
+                        const ans = change.doc.data();
+                        handleStudentAnswerSubmittedHost({
+                            studentId: ans.participantId,
+                            studentName: ans.studentName,
+                            questionIndex: ans.questionIndex,
+                            optionIndex: ans.selectedOption,
+                            isCorrect: ans.isCorrect,
+                            pointsAwarded: ans.pointsEarned
+                        });
+                    }
+                });
+            }, (err) => {
+                console.warn("[SKQ Host] Answers listener error:", err);
             });
     }
 }
@@ -3786,6 +3870,10 @@ function cleanupActiveHostListeners() {
     if (teacherUnsubParticipants) {
         try { teacherUnsubParticipants(); } catch(e) {}
         teacherUnsubParticipants = null;
+    }
+    if (teacherUnsubAnswers) {
+        try { teacherUnsubAnswers(); } catch(e) {}
+        teacherUnsubAnswers = null;
     }
     clearInterval(liveTimerInterval);
 }
@@ -3830,10 +3918,10 @@ function updateHostParticipantsUI() {
     Object.values(activeHostCompetition.participants).forEach(p => {
         const chip = document.createElement("div");
         chip.className = "student-chip";
-        const initial = (p.name || "S").charAt(0).toUpperCase();
+        const initial = (p.studentName || p.name || "S").charAt(0).toUpperCase();
         chip.innerHTML = `
             <span class="chip-avatar">${initial}</span>
-            <span>${p.name || "Student"}</span>
+            <span>${p.studentName || p.name || "Student"}</span>
         `;
         list.appendChild(chip);
     });
@@ -3846,28 +3934,34 @@ function updateHostParticipantsUI() {
 async function startLiveQuiz() {
     if (!activeHostCompetition) return;
 
-    activeHostCompetition.status = "in_progress";
+    activeHostCompetition.status = "active";
+    activeHostCompetition.phase = "question";
     activeHostCompetition.currentQuestionIndex = 0;
     activeHostCompetition.questionStartTime = Date.now();
     activeHostCompetition.questionDuration = 60;
     activeHostCompetition.answersSummary = {};
 
-    // Reset participant scores
+    // Reset participant scores in memory
     Object.keys(activeHostCompetition.participants || {}).forEach(pid => {
         activeHostCompetition.participants[pid].score = 0;
         activeHostCompetition.participants[pid].answers = {};
     });
 
-    if (typeof db !== "undefined") {
+    console.log("[SKQ Teacher] Starting live quiz. Current question index changed to 0 for room:", activeHostCompetition.code);
+
+    if (typeof db !== "undefined" && db) {
         try {
             await db.collection("liveCompetitions").doc(activeHostCompetition.code).update({
-                status: "in_progress",
+                status: "active",
+                phase: "question",
                 currentQuestionIndex: 0,
                 questionStartTime: Date.now(),
+                questionStartedAt: firebase.firestore.FieldValue.serverTimestamp(),
                 questionDuration: 60
             });
+            console.log("[SKQ Teacher] Firestore updated: phase = question, currentQuestionIndex = 0, status = active");
         } catch (e) {
-            console.warn("Firestore start update notice:", e);
+            console.warn("[SKQ Teacher] Firestore start update error:", e);
         }
     }
 
@@ -3886,8 +3980,9 @@ function renderHostQuestionView() {
     if (!activeHostCompetition) return;
 
     const qIdx = activeHostCompetition.currentQuestionIndex || 0;
-    const question = activeHostCompetition.questions[qIdx];
-    if (!question) return;
+    const rawQ = activeHostCompetition.questions[qIdx];
+    if (!rawQ) return;
+    const question = normalizeLiveQuestion(rawQ);
 
     document.getElementById("tLiveSubjectPill").textContent = `📚 ${activeHostCompetition.subject}`;
     document.getElementById("tLiveQuestionNumber").textContent = `Question ${qIdx + 1} of ${activeHostCompetition.totalQuestions}`;
@@ -3980,7 +4075,7 @@ function handleStudentAnswerSubmittedHost(event) {
         // If all joined participants have answered, finish question early!
         if (submitted >= total && total > 0) {
             setTimeout(() => {
-                if (activeHostCompetition.status === "in_progress") {
+                if (activeHostCompetition && (activeHostCompetition.phase === "question" || activeHostCompetition.status === "in_progress")) {
                     forceEndQuestionTimer();
                 }
             }, 800);
@@ -3995,31 +4090,36 @@ function handleStudentAnswerSubmittedHost(event) {
 function onQuestionTimerEndHost() {
     if (!activeHostCompetition) return;
 
-    activeHostCompetition.status = "question_result";
+    activeHostCompetition.status = "active";
+    activeHostCompetition.phase = "feedback";
     const qIdx = activeHostCompetition.currentQuestionIndex || 0;
-    const question = activeHostCompetition.questions[qIdx];
+    const rawQ = activeHostCompetition.questions[qIdx];
+    const question = normalizeLiveQuestion(rawQ);
 
     const summary = activeHostCompetition.answersSummary[qIdx] || { 0: 0, 1: 0, 2: 0, 3: 0, total: 0 };
     const totalParticipants = activeHostCompetition.participantCount || Object.keys(activeHostCompetition.participants || {}).length;
     const totalAnswered = summary.total || 0;
     const unanswered = Math.max(0, totalParticipants - totalAnswered);
 
-    // Write status to Firestore so cross-device students are notified
-    if (typeof db !== "undefined") {
-        // Build a plain summary object (remove 'submissions' to keep doc small)
+    console.log("[SKQ Teacher] Question ended. Phase changed to feedback for Question", qIdx + 1);
+
+    // Write phase: "feedback" to Firestore so cross-device students are notified
+    if (typeof db !== "undefined" && db) {
         const firestoreSummary = { 0: summary[0] || 0, 1: summary[1] || 0, 2: summary[2] || 0, 3: summary[3] || 0, total: summary.total || 0 };
         const answersSummaryUpdate = {};
         answersSummaryUpdate[`answersSummary.${qIdx}`] = firestoreSummary;
         db.collection("liveCompetitions").doc(activeHostCompetition.code).update({
-            status: "question_result",
+            status: "active",
+            phase: "feedback",
+            questionEndedAt: firebase.firestore.FieldValue.serverTimestamp(),
             ...answersSummaryUpdate
-        }).catch(e => console.warn("[SKQ Host] Firestore question_result update notice:", e));
+        }).catch(e => console.warn("[SKQ Host] Firestore feedback phase update notice:", e));
     }
 
     // Render Host Result Screen with Bar Graph
     renderHostResultScreen(question, summary, totalParticipants, totalAnswered, unanswered);
 
-    // Broadcast result event to same-device students (BroadcastChannel)
+    // Broadcast result event to same-device students
     broadcastLiveEvent({
         type: "SHOW_RESULT",
         code: activeHostCompetition.code,
@@ -4097,14 +4197,23 @@ function renderHostResultScreen(question, summary, totalParticipants, totalAnswe
 
 function calculateSortedLeaderboard(participantsMap) {
     const list = Object.values(participantsMap || {});
-    list.sort((a, b) => (b.score || 0) - (a.score || 0));
+    list.sort((a, b) => {
+        if ((b.score || 0) !== (a.score || 0)) {
+            return (b.score || 0) - (a.score || 0);
+        }
+        if ((b.correctAnswers || 0) !== (a.correctAnswers || 0)) {
+            return (b.correctAnswers || 0) - (a.correctAnswers || 0);
+        }
+        return (a.joinedAt || 0) - (b.joinedAt || 0);
+    });
     return list;
 }
 
 function showLiveLeaderboard() {
     if (!activeHostCompetition) return;
 
-    activeHostCompetition.status = "leaderboard";
+    activeHostCompetition.status = "active";
+    activeHostCompetition.phase = "leaderboard";
     const qIdx = activeHostCompetition.currentQuestionIndex || 0;
     const isLastQuestion = qIdx >= activeHostCompetition.totalQuestions - 1;
 
@@ -4113,26 +4222,18 @@ function showLiveLeaderboard() {
     // Update Host Next button text
     const nextBtn = document.getElementById("tNextQuestionBtn");
     if (nextBtn) {
-        nextBtn.textContent = isLastQuestion ? "🏆 View Final Champions Podium" : `Next Question (Q${qIdx + 2}) ➡️`;
+        nextBtn.textContent = isLastQuestion ? "🏆 Finish Quiz & View Final Champions Podium" : `Next Question (Q${qIdx + 2}) ➡️`;
     }
 
     document.getElementById("tLeaderboardSubtitle").textContent = `Rankings after Question ${qIdx + 1} of ${activeHostCompetition.totalQuestions}`;
 
     renderLeaderboardTable("tLeaderboardTableContainer", leaderboard, null);
 
-    // Write leaderboard status to Firestore for cross-device students
-    if (typeof db !== "undefined") {
-        // Update participant scores in their subcollection docs so student listener can read them
-        const batch = db.batch();
-        leaderboard.forEach(p => {
-            const pRef = db.collection("liveCompetitions").doc(activeHostCompetition.code)
-                .collection("participants").doc(p.id);
-            batch.update(pRef, { score: p.score || 0 });
-        });
-        batch.commit().catch(e => console.warn("[SKQ Host] Score sync notice:", e));
-
+    // Write phase: "leaderboard" to Firestore for cross-device students
+    if (typeof db !== "undefined" && db) {
         db.collection("liveCompetitions").doc(activeHostCompetition.code).update({
-            status: "leaderboard"
+            status: "active",
+            phase: "leaderboard"
         }).catch(e => console.warn("[SKQ Host] Firestore leaderboard update notice:", e));
     }
 
@@ -4147,7 +4248,6 @@ function showLiveLeaderboard() {
 
     showTeacherPage("teacherLeaderboard");
 }
-
 
 function renderLeaderboardTable(containerId, leaderboard, highlightPlayerId) {
     const container = document.getElementById(containerId);
@@ -4174,8 +4274,9 @@ function renderLeaderboardTable(containerId, leaderboard, highlightPlayerId) {
         const rank = idx + 1;
         const medals = { 1: "🥇", 2: "🥈", 3: "🥉" };
         const rankDisplay = medals[rank] ? `${medals[rank]} ${rank}` : `#${rank}`;
-        const isSelf = highlightPlayerId && highlightPlayerId === p.id;
-        const initial = (p.name || "S").charAt(0).toUpperCase();
+        const isSelf = highlightPlayerId && highlightPlayerId === (p.id || p.participantId);
+        const displayName = p.studentName || p.name || "Student";
+        const initial = displayName.charAt(0).toUpperCase();
 
         html += `
             <tr class="live-rank-row ${isSelf ? 'current-player-row' : ''}">
@@ -4183,7 +4284,7 @@ function renderLeaderboardTable(containerId, leaderboard, highlightPlayerId) {
                 <td>
                     <div class="player-info-cell">
                         <span class="player-avatar">${initial}</span>
-                        <strong>${p.name || "Student"}</strong>
+                        <strong>${displayName}</strong>
                         ${isSelf ? '<span class="score-delta-pill">YOU</span>' : ''}
                     </div>
                 </td>
@@ -4196,7 +4297,65 @@ function renderLeaderboardTable(containerId, leaderboard, highlightPlayerId) {
     container.innerHTML = html;
 }
 
-function proceedToNextQuestion() {
+function renderDetailedLeaderboardTable(containerId, leaderboard, highlightPlayerId, totalQuestions) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+
+    if (!leaderboard || leaderboard.length === 0) {
+        container.innerHTML = `<p style="text-align:center; padding: 20px; color: var(--muted);">No player data recorded yet.</p>`;
+        return;
+    }
+
+    let html = `
+        <table class="live-rank-table detailed-rank-table">
+            <thead>
+                <tr>
+                    <th style="width: 60px;">Rank</th>
+                    <th>Student Name</th>
+                    <th style="text-align: right;">Score</th>
+                    <th style="text-align: center;">Correct</th>
+                    <th style="text-align: center;">Wrong</th>
+                    <th style="text-align: center;">Accuracy</th>
+                </tr>
+            </thead>
+            <tbody>
+    `;
+
+    leaderboard.forEach((p, idx) => {
+        const rank = idx + 1;
+        const medals = { 1: "🥇", 2: "🥈", 3: "🥉" };
+        const rankDisplay = medals[rank] ? `${medals[rank]} ${rank}` : `#${rank}`;
+        const isSelf = highlightPlayerId && highlightPlayerId === (p.id || p.participantId);
+        const displayName = p.studentName || p.name || "Student";
+        const initial = displayName.charAt(0).toUpperCase();
+        const correct = p.correctAnswers || 0;
+        const wrong = p.wrongAnswers || 0;
+        const total = totalQuestions || (correct + wrong) || 1;
+        const pct = Math.round((correct / total) * 100);
+
+        html += `
+            <tr class="live-rank-row ${isSelf ? 'current-player-row' : ''}">
+                <td class="rank-badge-cell">${rankDisplay}</td>
+                <td>
+                    <div class="player-info-cell">
+                        <span class="player-avatar">${initial}</span>
+                        <strong>${displayName}</strong>
+                        ${isSelf ? '<span class="score-delta-pill">YOU</span>' : ''}
+                    </div>
+                </td>
+                <td class="player-score-cell" style="text-align: right; font-weight: 800;">${(p.score || 0).toLocaleString()} pts</td>
+                <td style="text-align: center; color: #10b981; font-weight: 700;">${correct}</td>
+                <td style="text-align: center; color: #ef4444; font-weight: 700;">${wrong}</td>
+                <td style="text-align: center; font-weight: 700;">${pct}%</td>
+            </tr>
+        `;
+    });
+
+    html += `</tbody></table>`;
+    container.innerHTML = html;
+}
+
+async function proceedToNextQuestion() {
     if (!activeHostCompetition) return;
 
     const qIdx = activeHostCompetition.currentQuestionIndex || 0;
@@ -4206,19 +4365,30 @@ function proceedToNextQuestion() {
         return;
     }
 
-    activeHostCompetition.currentQuestionIndex++;
-    activeHostCompetition.status = "in_progress";
+    const nextIndex = qIdx + 1;
+    activeHostCompetition.currentQuestionIndex = nextIndex;
+    activeHostCompetition.status = "active";
+    activeHostCompetition.phase = "question";
     activeHostCompetition.questionStartTime = Date.now();
     activeHostCompetition.questionDuration = 60;
 
+    console.log("[SKQ Teacher] Teacher moved to next question. Index:", nextIndex + 1);
+    console.log("[SKQ Teacher] Current question index changed in Firestore to:", nextIndex);
+
     // Write to Firestore so cross-device students receive the next question
-    if (typeof db !== "undefined") {
-        db.collection("liveCompetitions").doc(activeHostCompetition.code).update({
-            status: "in_progress",
-            currentQuestionIndex: activeHostCompetition.currentQuestionIndex,
-            questionStartTime: activeHostCompetition.questionStartTime,
-            questionDuration: 60
-        }).catch(e => console.warn("[SKQ Host] Firestore next question update notice:", e));
+    if (typeof db !== "undefined" && db) {
+        try {
+            await db.collection("liveCompetitions").doc(activeHostCompetition.code).update({
+                status: "active",
+                phase: "question",
+                currentQuestionIndex: nextIndex,
+                questionStartTime: activeHostCompetition.questionStartTime,
+                questionStartedAt: firebase.firestore.FieldValue.serverTimestamp(),
+                questionDuration: 60
+            });
+        } catch(e) {
+            console.warn("[SKQ Host] Firestore next question update notice:", e);
+        }
     }
 
     // Broadcast to same-device students
@@ -4233,49 +4403,48 @@ function proceedToNextQuestion() {
     startHostQuestionTimer();
 }
 
-
 /* =====================================================
    FINAL PODIUM & WINNERS CELEBRATION
 ===================================================== */
 
-function showFinalPodiumHost() {
+async function showFinalPodiumHost() {
     if (!activeHostCompetition) return;
 
     activeHostCompetition.status = "completed";
+    activeHostCompetition.phase = "finished";
     const leaderboard = calculateSortedLeaderboard(activeHostCompetition.participants);
 
     const winner1 = leaderboard[0] || { name: "Champion", score: 0 };
     const winner2 = leaderboard[1] || { name: "Runner Up", score: 0 };
     const winner3 = leaderboard[2] || { name: "3rd Place", score: 0 };
 
-    document.getElementById("podium1Name").textContent = winner1.name;
+    document.getElementById("podium1Name").textContent = winner1.studentName || winner1.name || "Champion";
     document.getElementById("podium1Score").textContent = `${(winner1.score || 0).toLocaleString()} pts`;
 
-    document.getElementById("podium2Name").textContent = winner2.name;
+    document.getElementById("podium2Name").textContent = winner2.studentName || winner2.name || "Runner Up";
     document.getElementById("podium2Score").textContent = `${(winner2.score || 0).toLocaleString()} pts`;
 
-    document.getElementById("podium3Name").textContent = winner3.name;
+    document.getElementById("podium3Name").textContent = winner3.studentName || winner3.name || "3rd Place";
     document.getElementById("podium3Score").textContent = `${(winner3.score || 0).toLocaleString()} pts`;
 
-    renderLeaderboardTable("tFinalLeaderboardTableContainer", leaderboard, null);
+    renderDetailedLeaderboardTable("tFinalLeaderboardTableContainer", leaderboard, null, activeHostCompetition.totalQuestions);
 
     createConfetti();
 
-    // Write 'completed' status to Firestore so cross-device students see final podium
-    if (typeof db !== "undefined") {
-        const batch = db.batch();
-        leaderboard.forEach(p => {
-            const pRef = db.collection("liveCompetitions").doc(activeHostCompetition.code)
-                .collection("participants").doc(p.id);
-            batch.update(pRef, { score: p.score || 0 });
-        });
-        batch.commit().catch(e => console.warn("[SKQ Host] Final score sync notice:", e));
+    console.log("[SKQ Teacher] Quiz finished. Setting phase = finished, status = completed.");
 
-        db.collection("liveCompetitions").doc(activeHostCompetition.code).update({
-            status: "completed",
-            temporaryQuestions: firebase.firestore.FieldValue.delete(),
-            questions: firebase.firestore.FieldValue.delete()
-        }).catch(e => console.warn("[SKQ Host] Firestore completed update notice:", e));
+    // Write 'completed' and 'finished' status to Firestore so cross-device students see final podium
+    if (typeof db !== "undefined" && db) {
+        try {
+            await db.collection("liveCompetitions").doc(activeHostCompetition.code).update({
+                status: "completed",
+                phase: "finished",
+                completedAt: firebase.firestore.FieldValue.serverTimestamp()
+            });
+            console.log("[SKQ Teacher] Firestore room marked completed and phase = finished");
+        } catch(e) {
+            console.warn("[SKQ Host] Firestore completed update notice:", e);
+        }
     }
 
     // Broadcast final podium to same-device students
@@ -4291,7 +4460,6 @@ function showFinalPodiumHost() {
     showTeacherPage("teacherPodium");
 }
 
-
 async function saveAndFinishCompetition() {
     if (!activeHostCompetition) {
         showTeacherPage("teacherDashboard");
@@ -4301,7 +4469,7 @@ async function saveAndFinishCompetition() {
     showLoading("Archiving Competition Results...");
 
     const leaderboard = calculateSortedLeaderboard(activeHostCompetition.participants);
-    const winner = leaderboard[0] ? leaderboard[0].name : "No Winner";
+    const winner = leaderboard[0] ? (leaderboard[0].studentName || leaderboard[0].name) : "No Winner";
 
     const totalScores = leaderboard.reduce((sum, p) => sum + (p.score || 0), 0);
     const avgScore = leaderboard.length > 0 ? Math.round(totalScores / leaderboard.length) : 0;
@@ -4323,7 +4491,7 @@ async function saveAndFinishCompetition() {
     saveStoredCompetitionHistory(historyRecord);
 
     // Save to Firestore
-    if (typeof db !== "undefined") {
+    if (typeof db !== "undefined" && db) {
         try {
             await db.collection("competitionHistory").add({
                 ...historyRecord,
@@ -4331,8 +4499,7 @@ async function saveAndFinishCompetition() {
             });
             await db.collection("liveCompetitions").doc(activeHostCompetition.code).update({
                 status: "completed",
-                temporaryQuestions: firebase.firestore.FieldValue.delete(),
-                questions: firebase.firestore.FieldValue.delete()
+                phase: "finished"
             });
         } catch (dbErr) {
             console.warn("Firestore history save notice:", dbErr);
@@ -4491,14 +4658,25 @@ function openStudentJoinPage() {
     const urlParams = new URLSearchParams(window.location.search);
     const joinCode = urlParams.get("join");
     if (joinCode) {
-        console.log("[SKQ Student] Student join code detected from URL:", joinCode);
+        const cleanCode = joinCode.trim().toUpperCase();
+        console.log("[SKQ Student] Student join code detected from URL:", cleanCode);
         const codeInput = document.getElementById("sJoinCodeInput");
         if (codeInput) {
-            codeInput.value = joinCode.toUpperCase();
-            if (nameInput && nameInput.value) {
-                // Auto-join if both are present
-                setTimeout(joinLiveCompetition, 300);
-            }
+            codeInput.value = cleanCode;
+        }
+
+        // Prefetch and display room title & subject
+        if (typeof db !== "undefined" && db) {
+            db.collection("liveCompetitions").doc(cleanCode).get().then(snap => {
+                if (snap.exists) {
+                    const data = snap.data();
+                    const preview = document.getElementById("sJoinRoomPreview");
+                    if (preview) {
+                        preview.innerHTML = `<h4>📚 ${data.title || data.subject || "Live Competition"}</h4><p>Room: <strong>${data.code || data.competitionCode || cleanCode}</strong> • ${data.totalQuestions || (data.questions ? data.questions.length : 5)} Questions</p>`;
+                        preview.classList.remove("hidden");
+                    }
+                }
+            }).catch(() => {});
         }
     }
 }
@@ -4669,28 +4847,41 @@ async function joinLiveCompetition() {
             return;
         }
 
-        // Ensure questions array is populated from temporaryQuestions if needed
-        if (!competitionData.questions || competitionData.questions.length === 0) {
-            if (competitionData.temporaryQuestions && competitionData.temporaryQuestions.length > 0) {
-                competitionData.questions = competitionData.temporaryQuestions;
-            }
-        }
+        // Ensure questions array is populated and normalized
+        const rawQuestions = competitionData.questions || competitionData.temporaryQuestions || [];
+        competitionData.questions = rawQuestions.map(normalizeLiveQuestion).filter(Boolean);
+        competitionData.totalQuestions = competitionData.questions.length;
 
         // Generate unique student participant ID
         const studentId = currentUser ? currentUser.uid : `s_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
         const participantObj = {
+            participantId: studentId,
             id: studentId,
+            studentName: nameInput,
             name: nameInput,
             score: 0,
-            joinedAt: Date.now()
+            correctAnswers: 0,
+            wrongAnswers: 0,
+            answeredCount: 0,
+            currentQuestionIndex: 0,
+            connected: true,
+            joinedAt: Date.now(),
+            lastUpdated: Date.now()
         };
 
         currentStudentLiveSession = {
-            code: competitionDocId,   // Use the actual Firestore doc ID
-            codeDisplay: normalizedCode,   // The code the student typed/scanned
+            code: competitionDocId,   // Use actual Firestore doc ID
+            codeDisplay: normalizedCode,   // Code typed or scanned
             studentId: studentId,
             studentName: nameInput,
             score: 0,
+            correctCount: 0,
+            wrongCount: 0,
+            answeredCount: 0,
+            currentQuestionIndex: -1,
+            hasAnsweredCurrentQuestion: false,
+            hasStartedQuiz: false,
+            lastAnswer: null,
             competition: competitionData,
             status: "waiting"
         };
@@ -4699,7 +4890,7 @@ async function joinLiveCompetition() {
         document.getElementById("sLivePlayerNameBadge").textContent = nameInput;
 
         // Register participant in Firestore
-        if (typeof db !== "undefined") {
+        if (typeof db !== "undefined" && db) {
             try {
                 console.log("[SKQ Student] Registering participant:", studentId, "in liveCompetitions/", competitionDocId, "/participants");
                 await db.collection("liveCompetitions")
@@ -4708,11 +4899,20 @@ async function joinLiveCompetition() {
                     .doc(studentId)
                     .set(participantObj);
                 console.log("[SKQ Student] Participant record created successfully.");
+
+                // Increment room participantCount in Firestore
+                db.collection("liveCompetitions").doc(competitionDocId).update({
+                    participantCount: firebase.firestore.FieldValue.increment(1)
+                }).catch(() => {});
             } catch(e) {
-                console.error("[SKQ Student] Firestore participant register FAILED:", e);
-                // Non-fatal — continue to waiting room
+                console.error("[SKQ Student] Firestore participant register notice:", e);
             }
         }
+
+        // Safe console logs required by user
+        console.log("[SKQ Student] Student joined competition code:", competitionDocId);
+        console.log("[SKQ Student] Room document loaded:", competitionDocId);
+        console.log("[SKQ Student] Number of questions loaded:", competitionData.questions.length);
 
         // Connect BroadcastChannel for same-device multi-tab sync
         setupBroadcastChannel(competitionDocId);
@@ -4725,7 +4925,7 @@ async function joinLiveCompetition() {
         hideLoading();
 
         // Setup student waiting room
-        document.getElementById("sWaitingSubjectTitle").textContent = `${competitionData.subject} Live Battle`;
+        document.getElementById("sWaitingSubjectTitle").textContent = `${competitionData.title || competitionData.subject || "Live Quiz"}`;
         document.getElementById("sWaitingPlayerName").textContent = nameInput;
         document.getElementById("sWaitingStudentCount").textContent = `${competitionData.participantCount || 1}`;
 
@@ -4750,103 +4950,151 @@ function attachStudentLiveListeners(code) {
         studentUnsubCompetition = null;
     }
 
-    if (typeof db !== "undefined") {
+    if (typeof db !== "undefined" && db) {
         console.log("[SKQ Student] Attaching Firestore real-time listener on liveCompetitions/", code);
         studentUnsubCompetition = db.collection("liveCompetitions").doc(code).onSnapshot(doc => {
             if (!doc.exists || !currentStudentLiveSession) return;
 
             const comp = doc.data();
-            const prevStatus = currentStudentLiveSession._lastKnownStatus || "";
 
-            // Update last known status to avoid duplicate triggers
-            if (comp.status === prevStatus && comp.currentQuestionIndex === currentStudentLiveSession._lastKnownQIdx) {
-                return;
+            // Populate & normalize questions
+            const rawQuestions = comp.questions || comp.temporaryQuestions || [];
+            if (rawQuestions.length > 0) {
+                currentStudentLiveSession.competition.questions = rawQuestions.map(normalizeLiveQuestion).filter(Boolean);
+                currentStudentLiveSession.competition.totalQuestions = currentStudentLiveSession.competition.questions.length;
             }
 
-            console.log("[SKQ Student] Firestore snapshot received. Status:", comp.status,
-                "| Question Index:", comp.currentQuestionIndex,
-                "| Prev Status:", prevStatus);
+            const phase = comp.phase || (comp.status === "in_progress" ? "question" : (comp.status === "question_result" ? "feedback" : (comp.status === "completed" ? "finished" : (comp.status || "waiting"))));
+            const qIdx = (typeof comp.currentQuestionIndex === "number") ? comp.currentQuestionIndex : 0;
 
-            currentStudentLiveSession._lastKnownStatus = comp.status;
-            currentStudentLiveSession._lastKnownQIdx = comp.currentQuestionIndex;
+            console.log("[SKQ Student] Room state update:", {
+                phase: phase,
+                currentQuestionIndex: qIdx,
+                status: comp.status,
+                questionsCount: (currentStudentLiveSession.competition.questions || []).length
+            });
 
-            if (comp.status === "in_progress") {
-                // First question start OR teacher moved to next question
-                if (prevStatus === "waiting" || prevStatus === "") {
-                    handleQuizStartedStudent(comp);
+            if (phase === "waiting") {
+                showStudentLiveScreen("studentWaitingRoom");
+                const waitHeading = document.getElementById("sWaitingStatusHeading");
+                if (waitHeading) waitHeading.textContent = "Waiting for the host to start the quiz...";
+                const waitSub = document.getElementById("sWaitingSubjectTitle");
+                if (waitSub) waitSub.textContent = `${comp.title || comp.subject || "Live Quiz"}`;
+                const waitCnt = document.getElementById("sWaitingStudentCount");
+                if (waitCnt && comp.participantCount) waitCnt.textContent = comp.participantCount;
+            } else if (phase === "question") {
+                // Active question state
+                if (currentStudentLiveSession.currentQuestionIndex !== qIdx || !currentStudentLiveSession.hasStartedQuiz) {
+                    console.log("[SKQ Student] Current question index changed to:", qIdx);
+                    currentStudentLiveSession.hasStartedQuiz = true;
+                    currentStudentLiveSession.currentQuestionIndex = qIdx;
+                    currentStudentLiveSession.hasAnsweredCurrentQuestion = false;
+                    currentStudentLiveSession.lastAnswer = null;
+                    studentSubmittedAnswer = false;
+
+                    renderStudentQuestionView();
+                    showStudentLiveScreen("studentLiveQuiz");
+                    startStudentQuestionTimer(comp.questionDuration || 60);
                 } else {
-                    // Next question transition
-                    handleNextQuestionStudent(comp);
+                    // Already on this question index: if not answered, stay on question view
+                    if (!currentStudentLiveSession.hasAnsweredCurrentQuestion) {
+                        showStudentLiveScreen("studentLiveQuiz");
+                    }
                 }
-            } else if (comp.status === "question_result") {
-                // Teacher has ended question timer — build result event from Firestore data
-                const qIdx = comp.currentQuestionIndex || 0;
+            } else if (phase === "feedback") {
+                // Between questions / answer feedback
+                if (!currentStudentLiveSession.hasAnsweredCurrentQuestion) {
+                    currentStudentLiveSession.hasAnsweredCurrentQuestion = true;
+                    studentSubmittedAnswer = true;
+                    currentStudentLiveSession.wrongCount = (currentStudentLiveSession.wrongCount || 0) + 1;
+                    currentStudentLiveSession.answeredCount = (currentStudentLiveSession.answeredCount || 0) + 1;
+                    showStudentInstantFeedback(null, qIdx);
+                }
                 const summary = (comp.answersSummary && comp.answersSummary[qIdx]) || { 0: 0, 1: 0, 2: 0, 3: 0, total: 0 };
-                handleShowResultStudent({
-                    answersSummary: summary,
-                    totalAnswered: summary.total || 0
-                });
-            } else if (comp.status === "leaderboard") {
-                // Teacher is showing leaderboard — fetch participant scores
+                handleShowResultStudent({ answersSummary: summary, totalAnswered: summary.total || 0 });
+            } else if (phase === "leaderboard") {
                 db.collection("liveCompetitions").doc(code).collection("participants").get().then(snap => {
                     const participants = [];
-                    snap.forEach(d => participants.push(d.data()));
-                    participants.sort((a, b) => (b.score || 0) - (a.score || 0));
-                    handleShowLeaderboardStudent({ leaderboard: participants });
-                }).catch(e => console.warn("[SKQ Student] Leaderboard fetch notice:", e));
-            } else if (comp.status === "completed") {
-                // Final podium
-                db.collection("liveCompetitions").doc(code).collection("participants").get().then(snap => {
-                    const participants = [];
-                    snap.forEach(d => participants.push(d.data()));
-                    participants.sort((a, b) => (b.score || 0) - (a.score || 0));
-                    handleShowPodiumStudent({
-                        leaderboard: participants,
-                        winner1: participants[0] || { name: "-", score: 0 },
-                        winner2: participants[1] || { name: "-", score: 0 },
-                        winner3: participants[2] || { name: "-", score: 0 }
+                    snap.forEach(d => {
+                        const pData = d.data();
+                        participants.push({
+                            id: d.id,
+                            participantId: d.id,
+                            studentName: pData.studentName || pData.name || "Student",
+                            name: pData.studentName || pData.name || "Student",
+                            score: pData.score || 0,
+                            correctAnswers: pData.correctAnswers || 0,
+                            wrongAnswers: pData.wrongAnswers || 0,
+                            answeredCount: pData.answeredCount || 0,
+                            joinedAt: pData.joinedAt || 0
+                        });
                     });
-                }).catch(e => console.warn("[SKQ Student] Podium fetch notice:", e));
+                    participants.sort((a, b) => {
+                        if ((b.score || 0) !== (a.score || 0)) return (b.score || 0) - (a.score || 0);
+                        if ((b.correctAnswers || 0) !== (a.correctAnswers || 0)) return (b.correctAnswers || 0) - (a.correctAnswers || 0);
+                        return (a.joinedAt || 0) - (b.joinedAt || 0);
+                    });
+                    handleShowLeaderboardStudent({ leaderboard: participants });
+                }).catch(e => console.warn("[SKQ Student] Leaderboard fetch error:", e));
+            } else if (phase === "finished" || comp.status === "completed") {
+                clearInterval(liveTimerInterval);
+                console.log("[SKQ Student] Quiz finished. Loading final leaderboard.");
+                loadStudentFinalPodiumAndLeaderboard(code);
             }
         }, err => console.warn("[SKQ Student] Firestore listener error:", err));
     }
 }
 
-
-/* --- Student Live Answering Flow --- */
+/* --- Student Live Question & Answer Flow --- */
 
 function handleQuizStartedStudent(competition) {
     if (!currentStudentLiveSession) return;
 
-    currentStudentLiveSession.competition = competition;
-    currentStudentLiveSession.status = "in_progress";
+    if (competition && competition.questions) {
+        currentStudentLiveSession.competition.questions = competition.questions.map(normalizeLiveQuestion).filter(Boolean);
+        currentStudentLiveSession.competition.totalQuestions = currentStudentLiveSession.competition.questions.length;
+    }
+    currentStudentLiveSession.currentQuestionIndex = 0;
+    currentStudentLiveSession.hasStartedQuiz = true;
+    currentStudentLiveSession.hasAnsweredCurrentQuestion = false;
+    currentStudentLiveSession.lastAnswer = null;
     studentSubmittedAnswer = false;
 
     renderStudentQuestionView();
     showStudentLiveScreen("studentLiveQuiz");
-    startStudentQuestionTimer();
+    startStudentQuestionTimer(competition ? (competition.questionDuration || 60) : 60);
 }
 
 function handleNextQuestionStudent(competition) {
     if (!currentStudentLiveSession) return;
 
-    currentStudentLiveSession.competition = competition;
+    if (competition && competition.questions) {
+        currentStudentLiveSession.competition.questions = competition.questions.map(normalizeLiveQuestion).filter(Boolean);
+        currentStudentLiveSession.competition.totalQuestions = currentStudentLiveSession.competition.questions.length;
+    }
+    const qIdx = competition ? (competition.currentQuestionIndex || 0) : 0;
+    currentStudentLiveSession.currentQuestionIndex = qIdx;
+    currentStudentLiveSession.hasAnsweredCurrentQuestion = false;
+    currentStudentLiveSession.lastAnswer = null;
     studentSubmittedAnswer = false;
 
     renderStudentQuestionView();
     showStudentLiveScreen("studentLiveQuiz");
-    startStudentQuestionTimer();
+    startStudentQuestionTimer(competition ? (competition.questionDuration || 60) : 60);
 }
 
 function renderStudentQuestionView() {
     if (!currentStudentLiveSession || !currentStudentLiveSession.competition) return;
 
     const comp = currentStudentLiveSession.competition;
-    const qIdx = comp.currentQuestionIndex || 0;
-    const q = comp.questions[qIdx];
-    if (!q) return;
+    const qIdx = currentStudentLiveSession.currentQuestionIndex >= 0 ? currentStudentLiveSession.currentQuestionIndex : 0;
+    const questions = comp.questions || [];
+    const rawQ = questions[qIdx];
+    if (!rawQ) return;
+    const q = normalizeLiveQuestion(rawQ);
 
-    document.getElementById("sLiveQBadge").textContent = `Question ${qIdx + 1} of ${comp.totalQuestions}`;
+    const totalQ = comp.totalQuestions || questions.length;
+    document.getElementById("sLiveQBadge").textContent = `Question ${qIdx + 1} of ${totalQ}`;
     document.getElementById("sLiveQuestionText").textContent = q.question;
 
     document.getElementById("sOptTextA").textContent = q.options[0] || "";
@@ -4854,26 +5102,29 @@ function renderStudentQuestionView() {
     document.getElementById("sOptTextC").textContent = q.options[2] || "";
     document.getElementById("sOptTextD").textContent = q.options[3] || "";
 
-    // Reset button states
+    // Reset button states: enable, clear all highlight classes
     document.querySelectorAll(".student-option-btn").forEach(btn => {
         btn.disabled = false;
-        btn.classList.remove("selected-option");
+        btn.classList.remove("selected-option", "is-correct-answer", "is-wrong-answer");
     });
 
     const feedback = document.getElementById("sAnswerFeedback");
-    if (feedback) feedback.classList.add("hidden");
+    if (feedback) {
+        feedback.className = "student-feedback-box hidden";
+        feedback.classList.add("hidden");
+    }
 }
 
-function startStudentQuestionTimer() {
+function startStudentQuestionTimer(duration = 60) {
     clearInterval(liveTimerInterval);
-    liveTimeRemaining = 60;
+    liveTimeRemaining = duration;
 
     const timerElem = document.getElementById("sLiveTimer");
     if (timerElem) timerElem.textContent = liveTimeRemaining;
 
     liveTimerInterval = setInterval(() => {
         liveTimeRemaining--;
-        if (timerElem) timerElem.textContent = liveTimeRemaining;
+        if (timerElem) timerElem.textContent = Math.max(0, liveTimeRemaining);
 
         if (liveTimeRemaining <= 0) {
             clearInterval(liveTimerInterval);
@@ -4881,53 +5132,139 @@ function startStudentQuestionTimer() {
             document.querySelectorAll(".student-option-btn").forEach(btn => {
                 btn.disabled = true;
             });
+            // If user hasn't submitted, show unanswered feedback
+            if (currentStudentLiveSession && !currentStudentLiveSession.hasAnsweredCurrentQuestion) {
+                currentStudentLiveSession.hasAnsweredCurrentQuestion = true;
+                studentSubmittedAnswer = true;
+                currentStudentLiveSession.wrongCount = (currentStudentLiveSession.wrongCount || 0) + 1;
+                currentStudentLiveSession.answeredCount = (currentStudentLiveSession.answeredCount || 0) + 1;
+                showStudentInstantFeedback(null, currentStudentLiveSession.currentQuestionIndex || 0);
+            }
         }
     }, 1000);
 }
 
 function submitStudentLiveAnswer(optionIndex) {
-    if (studentSubmittedAnswer || liveTimeRemaining <= 0) return;
+    if (!currentStudentLiveSession) return;
+    if (currentStudentLiveSession.hasAnsweredCurrentQuestion || studentSubmittedAnswer || liveTimeRemaining <= 0) return;
+
+    currentStudentLiveSession.hasAnsweredCurrentQuestion = true;
     studentSubmittedAnswer = true;
 
-    // Visual selection feedback
-    document.querySelectorAll(".student-option-btn").forEach((btn, idx) => {
+    // Immediately disable all 4 buttons to prevent multiple clicks
+    const optionButtons = document.querySelectorAll(".student-option-btn");
+    optionButtons.forEach((btn, idx) => {
         btn.disabled = true;
         if (idx === optionIndex) {
             btn.classList.add("selected-option");
         }
     });
 
-    const feedback = document.getElementById("sAnswerFeedback");
-    if (feedback) {
-        feedback.classList.remove("hidden");
-        document.getElementById("sFeedbackText").textContent = `Answer (${String.fromCharCode(65 + optionIndex)}) locked in! Waiting for timer to expire...`;
-    }
-
     const comp = currentStudentLiveSession.competition;
-    const qIdx = comp.currentQuestionIndex || 0;
-    const question = comp.questions[qIdx];
-    const isCorrect = optionIndex === question.answer;
+    const qIdx = currentStudentLiveSession.currentQuestionIndex >= 0 ? currentStudentLiveSession.currentQuestionIndex : 0;
+    const questions = comp.questions || [];
+    const question = normalizeLiveQuestion(questions[qIdx]);
+    if (!question) return;
 
-    // Kahoot-style scoring algorithm: 1000 base + speed bonus up to 500
+    const isCorrect = (optionIndex === question.answer);
+
+    // Scoring: 1000 base + speed bonus up to 500, 0 for incorrect
     let pointsAwarded = 0;
     if (isCorrect) {
-        const speedBonus = Math.round(500 * (liveTimeRemaining / 60));
+        const speedBonus = Math.round(500 * (Math.max(liveTimeRemaining, 0) / 60));
         pointsAwarded = 1000 + speedBonus;
         currentStudentLiveSession.correctCount = (currentStudentLiveSession.correctCount || 0) + 1;
     } else {
+        pointsAwarded = 0;
         currentStudentLiveSession.wrongCount = (currentStudentLiveSession.wrongCount || 0) + 1;
     }
 
+    currentStudentLiveSession.answeredCount = (currentStudentLiveSession.answeredCount || 0) + 1;
     currentStudentLiveSession.score = (currentStudentLiveSession.score || 0) + pointsAwarded;
+
     currentStudentLiveSession.lastAnswer = {
         questionIndex: qIdx,
         optionIndex: optionIndex,
+        selectedOption: optionIndex,
+        correctOption: question.answer,
         isCorrect: isCorrect,
         pointsAwarded: pointsAwarded,
+        pointsEarned: pointsAwarded,
         timeRemaining: liveTimeRemaining
     };
 
-    const answerPayload = {
+    console.log("[SKQ Student] Student answer submitted:", {
+        competitionCode: currentStudentLiveSession.code,
+        participantId: currentStudentLiveSession.studentId,
+        studentName: currentStudentLiveSession.studentName,
+        questionIndex: qIdx,
+        selectedOption: optionIndex,
+        isCorrect: isCorrect,
+        pointsEarned: pointsAwarded
+    });
+    console.log("[SKQ Student] Answer correctness:", isCorrect);
+    console.log("[SKQ Student] Score updated:", currentStudentLiveSession.score);
+
+    // Display INSTANT feedback on student's screen
+    showStudentInstantFeedback(currentStudentLiveSession.lastAnswer, qIdx);
+
+    // Highlight buttons: green for correct, red for incorrect
+    if (isCorrect) {
+        if (optionButtons[optionIndex]) optionButtons[optionIndex].classList.add("is-correct-answer");
+    } else {
+        if (optionButtons[optionIndex]) optionButtons[optionIndex].classList.add("is-wrong-answer");
+        if (optionButtons[question.answer]) optionButtons[question.answer].classList.add("is-correct-answer");
+    }
+
+    // Save answer to Firestore
+    if (typeof db !== "undefined" && db) {
+        const code = currentStudentLiveSession.code;
+        const studentId = currentStudentLiveSession.studentId;
+        const studentName = currentStudentLiveSession.studentName;
+
+        const answerPayload = {
+            competitionCode: code,
+            participantId: studentId,
+            studentName: studentName,
+            questionIndex: qIdx,
+            selectedOption: optionIndex,
+            correctOption: question.answer,
+            selectedOptionText: question.options[optionIndex] || "",
+            correctOptionText: question.options[question.answer] || "",
+            isCorrect: isCorrect,
+            pointsEarned: pointsAwarded,
+            answeredAt: firebase.firestore.FieldValue.serverTimestamp() || Date.now()
+        };
+
+        // 1. Write to liveCompetitions/{code}/answers
+        db.collection("liveCompetitions").doc(code)
+            .collection("answers").add(answerPayload)
+            .catch(e => console.warn("[SKQ Student] Subcollection answer notice:", e));
+
+        // 2. Update participant document
+        db.collection("liveCompetitions").doc(code)
+            .collection("participants").doc(studentId)
+            .update({
+                score: currentStudentLiveSession.score,
+                correctAnswers: currentStudentLiveSession.correctCount || 0,
+                wrongAnswers: currentStudentLiveSession.wrongCount || 0,
+                answeredCount: currentStudentLiveSession.answeredCount || 0,
+                currentQuestionIndex: qIdx,
+                connected: true,
+                lastUpdated: firebase.firestore.FieldValue.serverTimestamp() || Date.now()
+            })
+            .catch(e => console.warn("[SKQ Student] Participant score update notice:", e));
+
+        // 3. Write to competitionAnswers for audit trail
+        db.collection("competitionAnswers").add({
+            ...answerPayload,
+            pointsAwarded: pointsAwarded,
+            timeRemaining: liveTimeRemaining
+        }).catch(e => console.warn("[SKQ Student] competitionAnswers notice:", e));
+    }
+
+    // Broadcast to host (for same-device multi-tab testing)
+    broadcastLiveEvent({
         type: "ANSWER_SUBMITTED",
         code: currentStudentLiveSession.code,
         studentId: currentStudentLiveSession.studentId,
@@ -4937,38 +5274,59 @@ function submitStudentLiveAnswer(optionIndex) {
         isCorrect: isCorrect,
         pointsAwarded: pointsAwarded,
         timeRemaining: liveTimeRemaining
-    };
-
-    // Broadcast to host (same-device BroadcastChannel)
-    broadcastLiveEvent(answerPayload);
-
-    // Write answer to Firestore so cross-device hosts can track submissions
-    if (typeof db !== "undefined") {
-        const code = currentStudentLiveSession.code;
-        const studentId = currentStudentLiveSession.studentId;
-        const newScore = currentStudentLiveSession.score;
-
-        // Update participant score in subcollection
-        db.collection("liveCompetitions").doc(code)
-            .collection("participants").doc(studentId)
-            .update({ score: newScore })
-            .catch(e => console.warn("[SKQ Student] Firestore score update notice:", e));
-
-        // Write to competitionAnswers for audit trail
-        db.collection("competitionAnswers").add({
-            competitionCode: code,
-            studentId: studentId,
-            studentName: currentStudentLiveSession.studentName,
-            questionIndex: qIdx,
-            optionIndex: optionIndex,
-            isCorrect: isCorrect,
-            pointsAwarded: pointsAwarded,
-            timeRemaining: liveTimeRemaining,
-            submittedAt: firebase.firestore.FieldValue.serverTimestamp()
-        }).catch(e => console.warn("[SKQ Student] Firestore answer record notice:", e));
-    }
+    });
 }
 
+function showStudentInstantFeedback(lastAnswer, qIdx) {
+    const feedbackBox = document.getElementById("sAnswerFeedback");
+    if (!feedbackBox) return;
+
+    const comp = currentStudentLiveSession ? currentStudentLiveSession.competition : null;
+    const questions = comp ? (comp.questions || []) : [];
+    const rawQ = questions[qIdx];
+    const question = rawQ ? normalizeLiveQuestion(rawQ) : null;
+
+    feedbackBox.classList.remove("hidden");
+
+    if (lastAnswer && lastAnswer.isCorrect) {
+        feedbackBox.className = "student-feedback-box feedback-correct";
+        feedbackBox.innerHTML = `
+            <span class="feedback-icon" style="font-size: 1.8rem;">🎉</span>
+            <div class="feedback-text-wrap" style="text-align: left; flex: 1;">
+                <div style="font-size: 1.2rem; font-weight: 800; color: #10b981;">Correct answer!</div>
+                <div style="font-size: 1rem; font-weight: 700; color: #10b981; margin-top: 2px;">+${(lastAnswer.pointsAwarded || lastAnswer.pointsEarned || 0).toLocaleString()} points</div>
+                <div style="font-size: 0.85rem; margin-top: 4px; opacity: 0.85;">Answer submitted. Waiting for the next question...</div>
+            </div>
+        `;
+    } else if (lastAnswer && !lastAnswer.isCorrect) {
+        feedbackBox.className = "student-feedback-box feedback-incorrect";
+        const correctLetter = question ? String.fromCharCode(65 + question.answer) : "";
+        const correctText = question ? question.options[question.answer] : "";
+        feedbackBox.innerHTML = `
+            <span class="feedback-icon" style="font-size: 1.8rem;">❌</span>
+            <div class="feedback-text-wrap" style="text-align: left; flex: 1;">
+                <div style="font-size: 1.2rem; font-weight: 800; color: #ef4444;">Incorrect answer</div>
+                <div style="font-size: 0.95rem; font-weight: 700; color: #f59e0b; margin-top: 2px;">Correct answer: Option ${correctLetter} — "${correctText}"</div>
+                <div style="font-size: 0.9rem; font-weight: 600; opacity: 0.8; margin-top: 2px;">+0 points</div>
+                <div style="font-size: 0.85rem; margin-top: 4px; opacity: 0.85;">Answer submitted. Waiting for the next question...</div>
+            </div>
+        `;
+    } else {
+        // Timed out / unanswered
+        feedbackBox.className = "student-feedback-box feedback-incorrect";
+        const correctLetter = question ? String.fromCharCode(65 + question.answer) : "";
+        const correctText = question ? question.options[question.answer] : "";
+        feedbackBox.innerHTML = `
+            <span class="feedback-icon" style="font-size: 1.8rem;">⏱️</span>
+            <div class="feedback-text-wrap" style="text-align: left; flex: 1;">
+                <div style="font-size: 1.2rem; font-weight: 800; color: #ef4444;">Time's Up! (Unanswered)</div>
+                <div style="font-size: 0.95rem; font-weight: 700; color: #f59e0b; margin-top: 2px;">Correct answer: Option ${correctLetter} — "${correctText}"</div>
+                <div style="font-size: 0.9rem; font-weight: 600; opacity: 0.8; margin-top: 2px;">+0 points</div>
+                <div style="font-size: 0.85rem; margin-top: 4px; opacity: 0.85;">Waiting for the host to move to the next question...</div>
+            </div>
+        `;
+    }
+}
 
 function handleShowResultStudent(event) {
     clearInterval(liveTimerInterval);
@@ -4983,7 +5341,7 @@ function handleShowResultStudent(event) {
         banner.className = "s-result-banner banner-correct";
         iconElem.textContent = "🎉";
         statusText.textContent = "Correct!";
-        pointsText.textContent = `+${last.pointsAwarded.toLocaleString()} Points`;
+        pointsText.textContent = `+${(last.pointsAwarded || last.pointsEarned || 0).toLocaleString()} Points`;
     } else {
         banner.className = "s-result-banner banner-wrong";
         iconElem.textContent = "❌";
@@ -5023,7 +5381,7 @@ function handleShowLeaderboardStudent(event) {
     let myScore = currentStudentLiveSession ? currentStudentLiveSession.score : 0;
 
     leaderboard.forEach((p, idx) => {
-        if (p.id === myId) {
+        if (p.id === myId || p.participantId === myId) {
             myRank = `#${idx + 1}`;
             myScore = p.score || myScore;
         }
@@ -5037,92 +5395,115 @@ function handleShowLeaderboardStudent(event) {
     showStudentLiveScreen("studentLeaderboard");
 }
 
-function handleShowPodiumStudent(event) {
-    const leaderboard = event.leaderboard || [];
-    const myId = currentStudentLiveSession ? currentStudentLiveSession.studentId : null;
+async function loadStudentFinalPodiumAndLeaderboard(code) {
+    if (typeof db === "undefined" || !db) return;
 
-    let myRank = 0;
-    let myScore = currentStudentLiveSession ? currentStudentLiveSession.score : 0;
+    try {
+        const snap = await db.collection("liveCompetitions").doc(code)
+            .collection("participants").get();
 
-    leaderboard.forEach((p, idx) => {
-        if (p.id === myId) {
-            myRank = idx + 1;
-            myScore = p.score || myScore;
-        }
-    });
-
-    const rankText = myRank > 0 ? `You placed ${myRank === 1 ? '1st 🥇' : myRank === 2 ? '2nd 🥈' : myRank === 3 ? '3rd 🥉' : '#' + myRank}!` : "Competition Complete!";
-    document.getElementById("sMyFinalRankText").textContent = rankText;
-    document.getElementById("sMyFinalScoreText").textContent = `Total Score: ${myScore.toLocaleString()} pts`;
-
-    const medals = { 1: "🥇", 2: "🥈", 3: "🥉" };
-    document.getElementById("sMyFinalMedal").textContent = medals[myRank] || "🎖️";
-
-    // Set top 3 podium
-    const w1 = event.winner1 || { name: "-", score: 0 };
-    const w2 = event.winner2 || { name: "-", score: 0 };
-    const w3 = event.winner3 || { name: "-", score: 0 };
-
-    document.getElementById("sPodium1Name").textContent = w1.name;
-    document.getElementById("sPodium1Score").textContent = `${(w1.score || 0).toLocaleString()} pts`;
-
-    document.getElementById("sPodium2Name").textContent = w2.name;
-    document.getElementById("sPodium2Score").textContent = `${(w2.score || 0).toLocaleString()} pts`;
-
-    document.getElementById("sPodium3Name").textContent = w3.name;
-    document.getElementById("sPodium3Score").textContent = `${(w3.score || 0).toLocaleString()} pts`;
-
-    createConfetti();
-    showStudentLiveScreen("studentPodium");
-
-    // Save student result to competitionResults collection
-    if (typeof db !== "undefined" && currentStudentLiveSession && !currentStudentLiveSession._resultSaved) {
-        currentStudentLiveSession._resultSaved = true;
-        const comp = currentStudentLiveSession.competition;
-        const totalQ = comp ? (comp.totalQuestions || (comp.questions && comp.questions.length) || 1) : 1;
-        const correctAnswers = currentStudentLiveSession.correctCount || 0;
-        const wrongAnswers = currentStudentLiveSession.wrongCount || 0;
-        const unanswered = Math.max(0, totalQ - (correctAnswers + wrongAnswers));
-        const percentage = Math.round((correctAnswers / totalQ) * 100);
-
-        console.log("[SKQ Student] Final score calculated:", {
-            totalQuestions: totalQ,
-            correctAnswers: correctAnswers,
-            wrongAnswers: wrongAnswers,
-            unanswered: unanswered,
-            finalScore: myScore,
-            percentage: percentage
+        const participants = [];
+        snap.forEach(d => {
+            const pData = d.data();
+            participants.push({
+                id: d.id,
+                participantId: d.id,
+                studentName: pData.studentName || pData.name || "Student",
+                name: pData.studentName || pData.name || "Student",
+                score: pData.score || 0,
+                correctAnswers: pData.correctAnswers || 0,
+                wrongAnswers: pData.wrongAnswers || 0,
+                answeredCount: pData.answeredCount || 0,
+                joinedAt: pData.joinedAt || 0
+            });
         });
 
-        db.collection("competitionResults").add({
-            competitionCode: currentStudentLiveSession.code,
-            studentId: currentStudentLiveSession.studentId,
-            studentName: currentStudentLiveSession.studentName,
-            finalScore: myScore,
-            rank: myRank,
-            totalQuestions: totalQ,
-            correctAnswers: correctAnswers,
-            wrongAnswers: wrongAnswers,
-            unanswered: unanswered,
-            percentage: percentage,
-            submittedAt: firebase.firestore.FieldValue.serverTimestamp()
-        }).then(docRef => {
-            console.log("[SKQ Student] Result saved to competitionResults:", {
+        // Sort by: 1. highest score, 2. highest correct answers, 3. joinedAt asc
+        participants.sort((a, b) => {
+            if ((b.score || 0) !== (a.score || 0)) return (b.score || 0) - (a.score || 0);
+            if ((b.correctAnswers || 0) !== (a.correctAnswers || 0)) return (b.correctAnswers || 0) - (a.correctAnswers || 0);
+            return (a.joinedAt || 0) - (b.joinedAt || 0);
+        });
+
+        console.log("[SKQ Student] Leaderboard loaded. Total participants in room:", participants.length);
+
+        const myId = currentStudentLiveSession ? currentStudentLiveSession.studentId : null;
+        let myRank = 1;
+        let myData = null;
+
+        participants.forEach((p, idx) => {
+            if (p.id === myId || p.participantId === myId) {
+                myRank = idx + 1;
+                myData = p;
+            }
+        });
+
+        const comp = currentStudentLiveSession ? currentStudentLiveSession.competition : null;
+        const totalQ = comp ? (comp.totalQuestions || (comp.questions && comp.questions.length) || 1) : 1;
+        const myScore = myData ? myData.score : (currentStudentLiveSession ? currentStudentLiveSession.score : 0);
+        const myCorrect = myData ? myData.correctAnswers : (currentStudentLiveSession ? (currentStudentLiveSession.correctCount || 0) : 0);
+        const myWrong = myData ? myData.wrongAnswers : (currentStudentLiveSession ? (currentStudentLiveSession.wrongCount || 0) : 0);
+        const myPct = totalQ > 0 ? Math.round((myCorrect / totalQ) * 100) : 0;
+
+        const rankText = myRank > 0 ? `You placed ${myRank === 1 ? '1st 🥇' : myRank === 2 ? '2nd 🥈' : myRank === 3 ? '3rd 🥉' : '#' + myRank}!` : "Competition Complete!";
+        document.getElementById("sMyFinalRankText").textContent = rankText;
+        document.getElementById("sMyFinalScoreText").textContent = `Total Score: ${myScore.toLocaleString()} pts | Correct: ${myCorrect}/${totalQ} (${myPct}%)`;
+
+        const medals = { 1: "🥇", 2: "🥈", 3: "🥉" };
+        document.getElementById("sMyFinalMedal").textContent = medals[myRank] || "🎖️";
+
+        // Set top 3 podium
+        const w1 = participants[0] || { studentName: "-", score: 0 };
+        const w2 = participants[1] || { studentName: "-", score: 0 };
+        const w3 = participants[2] || { studentName: "-", score: 0 };
+
+        document.getElementById("sPodium1Name").textContent = w1.studentName || w1.name || "-";
+        document.getElementById("sPodium1Score").textContent = `${(w1.score || 0).toLocaleString()} pts`;
+
+        document.getElementById("sPodium2Name").textContent = w2.studentName || w2.name || "-";
+        document.getElementById("sPodium2Score").textContent = `${(w2.score || 0).toLocaleString()} pts`;
+
+        document.getElementById("sPodium3Name").textContent = w3.studentName || w3.name || "-";
+        document.getElementById("sPodium3Score").textContent = `${(w3.score || 0).toLocaleString()} pts`;
+
+        // Render Detailed Leaderboard Table
+        renderDetailedLeaderboardTable("sDetailedLeaderboardContainer", participants, myId, totalQ);
+
+        createConfetti();
+        showStudentLiveScreen("studentPodium");
+
+        // Save student result to competitionResults collection (once)
+        if (!currentStudentLiveSession._resultSaved) {
+            currentStudentLiveSession._resultSaved = true;
+            db.collection("competitionResults").add({
                 competitionCode: currentStudentLiveSession.code,
-                documentId: docRef.id,
-                collection: "competitionResults",
-                status: "saved"
-            });
-        }).catch(err => console.warn("[SKQ Student] competitionResults save notice:", err));
+                studentId: currentStudentLiveSession.studentId,
+                studentName: currentStudentLiveSession.studentName,
+                finalScore: myScore,
+                rank: myRank,
+                totalQuestions: totalQ,
+                correctAnswers: myCorrect,
+                wrongAnswers: myWrong,
+                percentage: myPct,
+                submittedAt: firebase.firestore.FieldValue.serverTimestamp()
+            }).catch(err => console.warn("[SKQ Student] competitionResults notice:", err));
+        }
+
+    } catch (err) {
+        console.error("[SKQ Student] Final podium error:", err);
     }
+}
+
+function handleShowPodiumStudent(event) {
+    if (!currentStudentLiveSession) return;
+    loadStudentFinalPodiumAndLeaderboard(currentStudentLiveSession.code);
 }
 
 /* =====================================================
    AUTO-INITIALIZE IF REFRESHED / RESUMED
 ===================================================== */
 
-window.addEventListener("DOMContentLoaded", () => {
-    // Check if teacher was logged in
+function checkAndHandleUrlJoin() {
     try {
         const savedTeacher = localStorage.getItem("skillquest_teacher");
         if (savedTeacher) {
@@ -5133,9 +5514,16 @@ window.addEventListener("DOMContentLoaded", () => {
     // Check if URL has ?join=SKQ-XXXXXX
     const urlParams = new URLSearchParams(window.location.search);
     if (urlParams.has("join")) {
+        console.log("[SKQ Student] Auto-opening join screen for URL code:", urlParams.get("join"));
         openStudentJoinPage();
     }
-});
+}
+
+if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", checkAndHandleUrlJoin);
+} else {
+    checkAndHandleUrlJoin();
+}
 
 /* =====================================================
    STAFF-CREATED QUIZ BUILDER SYSTEM
@@ -5518,13 +5906,16 @@ async function publishStaffCreatedQuiz() {
         teacherId: currentTeacher ? (currentTeacher.teacherId || currentTeacher.uid || "TEACHER-01") : "TEACHER-01",
         teacherName: currentTeacher ? currentTeacher.name : creatorName,
         title: title,
-        subject: `${title}`,
-        status: "waiting",
+        subject: subject,
+        status: "active",
+        phase: "waiting",
         temporaryQuestions: sanitizedQuestions,
         questions: sanitizedQuestions,
         totalQuestions: count,
         currentQuestionIndex: 0,
         questionStartTime: null,
+        questionStartedAt: null,
+        questionEndedAt: null,
         questionDuration: duration,
         participantCount: 0,
         participants: {},
