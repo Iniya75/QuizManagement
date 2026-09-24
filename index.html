@@ -1819,8 +1819,16 @@
     <!-- STUDENT LIVE QUIZ QUESTION SCREEN -->
     <section id="studentLiveQuiz" class="page student-live-page">
         <div class="student-quiz-container">
+            <div class="student-quiz-meta-header">
+                <h3 id="sLiveQuizTitle">Live Quiz</h3>
+                <span id="sLiveSubjectBadge" class="meta-pill">Subject</span>
+            </div>
+
             <div class="student-quiz-top">
                 <div class="q-badge" id="sLiveQBadge">Question 1 of 5</div>
+                <div class="student-score-tag" id="sLiveScoreBadge">
+                    Score: 0 pts
+                </div>
                 <div class="student-timer-box" id="sTimerBox">
                     ⏱️ <span id="sLiveTimer">60</span>s
                 </div>
@@ -1833,25 +1841,29 @@
             <!-- 4 KAHOOT-STYLE INTERACTIVE BUTTONS -->
             <div class="student-options-grid" id="sStudentOptionsGrid">
                 <button class="student-option-btn s-opt-a" onclick="submitStudentLiveAnswer(0)">
-                    <span class="btn-tag">▲ A</span>
+                    <span class="btn-tag">[A]</span>
                     <span class="btn-text" id="sOptTextA">Option A</span>
                 </button>
 
                 <button class="student-option-btn s-opt-b" onclick="submitStudentLiveAnswer(1)">
-                    <span class="btn-tag">◆ B</span>
+                    <span class="btn-tag">[B]</span>
                     <span class="btn-text" id="sOptTextB">Option B</span>
                 </button>
 
                 <button class="student-option-btn s-opt-c" onclick="submitStudentLiveAnswer(2)">
-                    <span class="btn-tag">● C</span>
+                    <span class="btn-tag">[C]</span>
                     <span class="btn-text" id="sOptTextC">Option C</span>
                 </button>
 
                 <button class="student-option-btn s-opt-d" onclick="submitStudentLiveAnswer(3)">
-                    <span class="btn-tag">■ D</span>
+                    <span class="btn-tag">[D]</span>
                     <span class="btn-text" id="sOptTextD">Option D</span>
                 </button>
             </div>
+
+            <p id="sLiveSelectPrompt" style="text-align: center; color: var(--muted); font-size: 0.95rem; font-weight: 600; margin: 10px 0 16px 0;">
+                Select one answer
+            </p>
 
             <div id="sAnswerFeedback" class="student-feedback-box hidden">
                 <span class="feedback-icon" id="sFeedbackIcon">🔒</span>
