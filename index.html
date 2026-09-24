@@ -1760,6 +1760,8 @@
             <h2>Join Live Competition</h2>
             <p>Enter the Competition Code and your Name.</p>
 
+            <div id="sJoinRoomPreview" class="join-room-preview hidden"></div>
+
             <div class="input-group">
                 <label>Competition Code / PIN</label>
                 <input type="text" id="sJoinCodeInput" placeholder="e.g. SKQ-482731" uppercase maxlength="12" style="font-size: 1.2rem; letter-spacing: 2px; text-transform: uppercase; font-weight: 700; text-align: center;">
@@ -1798,7 +1800,7 @@
             <div class="waiting-radar-box">
                 <div class="radar-pulse"></div>
                 <div class="waiting-spinner-glow">⏳</div>
-                <h2>Waiting for teacher to start...</h2>
+                <h2 id="sWaitingStatusHeading">Waiting for the host to start the quiz...</h2>
                 <p>Questions will automatically appear on your screen once the teacher begins the match.</p>
             </div>
 
@@ -1852,8 +1854,12 @@
             </div>
 
             <div id="sAnswerFeedback" class="student-feedback-box hidden">
-                <span class="feedback-icon">🔒</span>
-                <span id="sFeedbackText">Answer locked in! Waiting for timer to expire...</span>
+                <span class="feedback-icon" id="sFeedbackIcon">🔒</span>
+                <div class="feedback-text-wrap" id="sFeedbackWrap" style="text-align: left; flex: 1;">
+                    <div id="sFeedbackTitle" style="font-size: 1.15rem; font-weight: 800;">Answer submitted!</div>
+                    <div id="sFeedbackSub" style="font-size: 0.95rem; margin-top: 3px; font-weight: 700;"></div>
+                    <div id="sFeedbackWaiting" style="font-size: 0.85rem; margin-top: 4px; opacity: 0.85;">Waiting for the host to move to the next question...</div>
+                </div>
             </div>
         </div>
     </section>
@@ -1969,8 +1975,13 @@
                     <div class="pedestal pedestal-3"><span>3RD</span></div>
                 </div>
             </div>
+            
+            <div class="podium-leaderboard-wrap" style="margin-top: 25px; text-align: left;">
+                <h3 style="margin-bottom: 12px; font-size: 1.2rem; text-align: center;">Final Match Standings 📊</h3>
+                <div id="sDetailedLeaderboardContainer" class="leaderboard-table-container"></div>
+            </div>
 
-            <div class="podium-actions">
+            <div class="podium-actions" style="margin-top: 20px;">
                 <button class="primary-btn full-btn" onclick="exitStudentLiveQuiz()">
                     🏠 Back to Main Menu
                 </button>
