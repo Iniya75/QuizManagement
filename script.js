@@ -16,7 +16,7 @@
 ===================================================== */
 
 const QUIZ_API_KEY =
-    "qa_sk_c50b894df4b654ab291ad610d3233c13920446d3";
+    "YOUR_BACKEND_API_KEY";
 
 const QUIZ_API_BASE =
     "https://quizapi.io/api/v1/questions";
