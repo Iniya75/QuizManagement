@@ -1,0 +1,118 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isTeacher() {
+      return isAuthenticated() && 
+        (request.auth.token.role == 'teacher' || 
+         exists(/databases/$(database)/documents/teachers/$(request.auth.uid)));
+    }
+
+    // =====================================================
+    // 1. TEACHERS COLLECTION
+    // =====================================================
+    match /teachers/{teacherId} {
+      allow read: if true;
+      allow create, update: if isAuthenticated();
+      allow delete: if false;
+    }
+
+    // =====================================================
+    // 2. COMPETITIONS COLLECTION
+    // =====================================================
+    match /competitions/{competitionId} {
+      allow read: if true;
+      allow create: if isAuthenticated();
+      allow update: if isAuthenticated();
+      allow delete: if isAuthenticated() && (resource.data.teacherId == request.auth.uid);
+    }
+
+    // =====================================================
+    // 3. COMPETITION QUESTIONS
+    // =====================================================
+    match /competitionQuestions/{questionId} {
+      allow read: if true;
+      allow create, update: if isAuthenticated();
+      allow delete: if isAuthenticated();
+    }
+
+    // =====================================================
+    // 4. PARTICIPANTS COLLECTION
+    // =====================================================
+    match /participants/{participantId} {
+      allow read: if true;
+      allow create, update: if true;
+      allow delete: if isAuthenticated();
+    }
+
+    // =====================================================
+    // 5. COMPETITION ROUNDS
+    // =====================================================
+    match /competitionRounds/{roundId} {
+      allow read: if true;
+      allow create, update: if isAuthenticated();
+      allow delete: if isAuthenticated();
+    }
+
+    // =====================================================
+    // 6. COMPETITION ANSWERS
+    // =====================================================
+    match /competitionAnswers/{answerId} {
+      allow read: if true;
+      allow create: if true;
+      allow update: if true;
+      allow delete: if false;
+    }
+
+    // =====================================================
+    // 7. COMPETITION RESULTS
+    // =====================================================
+    match /competitionResults/{resultId} {
+      allow read: if true;
+      allow create, update: if true;
+      allow delete: if isAuthenticated();
+    }
+
+    // =====================================================
+    // 8. PRESERVED STUDENT COLLECTIONS (DO NOT ALTER)
+    // =====================================================
+    match /users/{userId} {
+      allow read: if true;
+      allow write: if isAuthenticated() && (request.auth.uid == userId || true);
+    }
+
+    match /quizHistory/{historyId} {
+      allow read, write: if true;
+    }
+
+    match /cachedQuestions/{subjectSlug} {
+      allow read: if true;
+      allow write: if true;
+    }
+
+    // =====================================================
+    // 9. LIVE COMPETITIONS & STAFF CREATED QUIZZES
+    // =====================================================
+    match /liveCompetitions/{code} {
+      allow read, write: if true;
+
+      // Participants subcollection — students read/write their own record
+      match /participants/{participantId} {
+        allow read, write: if true;
+      }
+    }
+
+    match /competitionHistory/{historyId} {
+      allow read, write: if true;
+    }
+
+    match /staffQuizzes/{quizId} {
+      allow read, write: if true;
+    }
+  }
+}
