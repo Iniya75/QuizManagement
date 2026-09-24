@@ -3467,6 +3467,7 @@ async function launchCompetitionLobby() {
     // In-memory object — uses ISO string (safe for JSON/localStorage)
     const competitionData = {
         code: code,
+        competitionCode: code,
         teacherId: currentTeacher ? (currentTeacher.teacherId || currentTeacher.uid || "TEACHER-01") : "TEACHER-01",
         teacherName: currentTeacher ? currentTeacher.name : "Professor",
         subject: subject,
@@ -3489,20 +3490,24 @@ async function launchCompetitionLobby() {
     // Save to Firestore — use serverTimestamp only in the Firestore payload
     if (typeof db !== "undefined") {
         try {
-            console.log("[SKQ] Saving competition to Firestore:", code, "collection: liveCompetitions");
+            console.log("[SKQ Teacher] Generated competition code:", code);
+            console.log("[SKQ Teacher] Firebase collection name: liveCompetitions");
+            console.log("[SKQ Teacher] Firebase document ID:", code);
+            console.log("[SKQ Teacher] Saved competition fields:", Object.keys(competitionData));
+            console.log("[SKQ Teacher] Saving competition to Firestore:", code, "collection: liveCompetitions");
             await db.collection("liveCompetitions").doc(code).set({
                 ...competitionData,
                 createdAt: firebase.firestore.FieldValue.serverTimestamp()
             });
-            console.log("[SKQ] Competition saved to Firestore successfully. Doc ID:", code);
+            console.log("[SKQ Teacher] Result of Firebase write operation: SUCCESS (Doc ID:", code, ")");
         } catch (dbErr) {
-            console.error("[SKQ] Firestore save FAILED:", dbErr);
+            console.error("[SKQ Teacher] Result of Firebase write operation: FAILED -", dbErr);
             hideLoading();
             showToast("⚠️ Failed to save competition to database. Check console.");
             return;
         }
     } else {
-        console.warn("[SKQ] Firestore (db) not available — running in local-only mode.");
+        console.warn("[SKQ Teacher] Firestore (db) not available — running in local-only mode.");
     }
 
     // Broadcast setup for multi-tab/same-device synchronization
@@ -4445,17 +4450,19 @@ function exitStudentLiveQuiz() {
 }
 
 async function joinLiveCompetition() {
-    // Normalize: trim whitespace and force uppercase for consistent matching
+    const urlParams = new URLSearchParams(window.location.search);
+    const codeFromUrl = urlParams.get("join") || "";
     const rawCode = document.getElementById("sJoinCodeInput").value;
-    const codeInput = rawCode.trim().toUpperCase();
+    const normalizedCode = String(rawCode || "").trim().toUpperCase();
     const nameInput = document.getElementById("sJoinNameInput").value.trim();
     const errElem = document.getElementById("sJoinError");
     errElem.textContent = "";
 
-    console.log("[SKQ Student] QR/manual param received:", rawCode);
-    console.log("[SKQ Student] Normalized competition code:", codeInput);
+    console.log("[SKQ Student] Code received from URL:", codeFromUrl);
+    console.log("[SKQ Student] Code entered by student:", rawCode);
+    console.log("[SKQ Student] Normalized code:", normalizedCode);
 
-    if (!codeInput) {
+    if (!normalizedCode) {
         errElem.textContent = "Please enter the Competition Code.";
         return;
     }
@@ -4468,46 +4475,100 @@ async function joinLiveCompetition() {
 
     try {
         let competitionData = null;
-        let competitionDocId = codeInput; // doc ID used to register participant
+        let competitionDocId = normalizedCode;
+        let lastError = null;
+
+        // Build list of candidate codes to check (exact normalized, and with SKQ- prefix if user typed just 6 digits)
+        const codesToCheck = [normalizedCode];
+        if (!normalizedCode.startsWith("SKQ-") && /^\d+$/.test(normalizedCode)) {
+            codesToCheck.push(`SKQ-${normalizedCode}`);
+        }
 
         // 1. Check local active competition first (same-tab / demo mode)
-        if (activeHostCompetition && activeHostCompetition.code === codeInput) {
-            console.log("[SKQ Student] Found competition in local memory (same-tab mode)");
-            competitionData = { ...activeHostCompetition };
-        }
-
-        // 2. Try Firestore: doc ID is the competition code (primary lookup)
-        if (!competitionData && typeof db !== "undefined") {
-            console.log("[SKQ Student] Querying Firestore collection: liveCompetitions, doc ID:", codeInput);
-            const docSnap = await db.collection("liveCompetitions").doc(codeInput).get();
-            console.log("[SKQ Student] Firestore doc exists:", docSnap.exists);
-            if (docSnap.exists) {
-                competitionData = docSnap.data();
-                competitionDocId = codeInput;
-                console.log("[SKQ Student] Competition document found. Status:", competitionData.status);
+        for (const candidate of codesToCheck) {
+            if (activeHostCompetition && (activeHostCompetition.code === candidate || activeHostCompetition.competitionCode === candidate)) {
+                console.log("[SKQ Student] Found competition in local memory (same-tab mode):", candidate);
+                competitionData = { ...activeHostCompetition };
+                competitionDocId = candidate;
+                break;
             }
         }
 
-        // 3. Fallback: query by 'code' field in case doc ID differs from code
+        // 2. Query Firestore liveCompetitions
         if (!competitionData && typeof db !== "undefined") {
-            console.log("[SKQ Student] Fallback: querying liveCompetitions where code ==", codeInput);
-            const querySnap = await db.collection("liveCompetitions")
-                .where("code", "==", codeInput)
-                .limit(1)
-                .get();
-            console.log("[SKQ Student] Fallback query result count:", querySnap.size);
-            if (!querySnap.empty) {
-                const docData = querySnap.docs[0];
-                competitionData = docData.data();
-                competitionDocId = docData.id;
-                console.log("[SKQ Student] Competition found via fallback query. Doc ID:", competitionDocId);
+            for (const candidate of codesToCheck) {
+                // A. Query by competitionCode field
+                try {
+                    console.log("[SKQ Student] Collection being queried: liveCompetitions | Field being queried: competitionCode ==", candidate);
+                    const qCompCode = await db.collection("liveCompetitions")
+                        .where("competitionCode", "==", candidate)
+                        .limit(1)
+                        .get();
+                    console.log("[SKQ Student] Number of documents returned (field: competitionCode):", qCompCode.size);
+                    if (!qCompCode.empty) {
+                        const docSnap = qCompCode.docs[0];
+                        competitionData = docSnap.data();
+                        competitionDocId = docSnap.id;
+                        console.log("[SKQ Student] Competition found by competitionCode field. Doc ID:", competitionDocId);
+                        break;
+                    }
+                } catch (err) {
+                    lastError = err;
+                    console.warn("[SKQ Student] Query by competitionCode warning/error:", err.message);
+                }
+
+                // B. Query by code field
+                if (!competitionData) {
+                    try {
+                        console.log("[SKQ Student] Collection being queried: liveCompetitions | Field being queried: code ==", candidate);
+                        const qCode = await db.collection("liveCompetitions")
+                            .where("code", "==", candidate)
+                            .limit(1)
+                            .get();
+                        console.log("[SKQ Student] Number of documents returned (field: code):", qCode.size);
+                        if (!qCode.empty) {
+                            const docSnap = qCode.docs[0];
+                            competitionData = docSnap.data();
+                            competitionDocId = docSnap.id;
+                            console.log("[SKQ Student] Competition found by code field. Doc ID:", competitionDocId);
+                            break;
+                        }
+                    } catch (err) {
+                        lastError = err;
+                        console.warn("[SKQ Student] Query by code warning/error:", err.message);
+                    }
+                }
+
+                // C. Query by document ID
+                if (!competitionData) {
+                    try {
+                        console.log("[SKQ Student] Collection being queried: liveCompetitions | Doc ID being queried:", candidate);
+                        const docDirect = await db.collection("liveCompetitions").doc(candidate).get();
+                        console.log("[SKQ Student] Number of documents returned (by Doc ID):", docDirect.exists ? 1 : 0);
+                        if (docDirect.exists) {
+                            competitionData = docDirect.data();
+                            competitionDocId = docDirect.id;
+                            console.log("[SKQ Student] Competition found by Doc ID:", competitionDocId);
+                            break;
+                        }
+                    } catch (err) {
+                        lastError = err;
+                        console.warn("[SKQ Student] Direct doc lookup warning/error:", err.message);
+                    }
+                }
             }
+        }
+
+        if (lastError && !competitionData) {
+            console.error("[SKQ Student] Firebase error message:", lastError.message);
+        } else {
+            console.log("[SKQ Student] Firebase error message: None");
         }
 
         if (!competitionData) {
             hideLoading();
-            console.warn("[SKQ Student] Competition NOT found for code:", codeInput);
-            errElem.textContent = `Competition room "${codeInput}" not found. Please verify the code.`;
+            console.warn("[SKQ Student] Competition NOT found for code:", normalizedCode);
+            errElem.textContent = `Competition room "${normalizedCode}" not found. Please verify the code.`;
             return;
         }
 
@@ -5309,6 +5370,7 @@ async function publishStaffCreatedQuiz() {
 
     const competitionData = {
         code: code,
+        competitionCode: code,
         title: title,
         teacherId: currentTeacher ? (currentTeacher.teacherId || currentTeacher.uid || "TEACHER-01") : "TEACHER-01",
         teacherName: currentTeacher ? currentTeacher.name : "Professor",
@@ -5332,12 +5394,16 @@ async function publishStaffCreatedQuiz() {
     // Save to Firestore — serverTimestamp only in Firestore payload
     if (typeof db !== "undefined") {
         try {
-            console.log("[SKQ] Saving staff quiz competition to Firestore:", code, "collection: liveCompetitions");
+            console.log("[SKQ Teacher Custom] Generated competition code:", code);
+            console.log("[SKQ Teacher Custom] Firebase collection name: liveCompetitions");
+            console.log("[SKQ Teacher Custom] Firebase document ID:", code);
+            console.log("[SKQ Teacher Custom] Saved competition fields:", Object.keys(competitionData));
+            console.log("[SKQ Teacher Custom] Saving staff quiz competition to Firestore:", code, "collection: liveCompetitions");
             await db.collection("liveCompetitions").doc(code).set({
                 ...competitionData,
                 createdAt: firebase.firestore.FieldValue.serverTimestamp()
             });
-            console.log("[SKQ] Staff quiz competition saved to Firestore. Doc ID:", code);
+            console.log("[SKQ Teacher Custom] Result of Firebase write operation: SUCCESS (Doc ID:", code, ")");
 
             await db.collection("staffQuizzes").add({
                 title: title,
@@ -5350,13 +5416,13 @@ async function publishStaffCreatedQuiz() {
                 createdAt: firebase.firestore.FieldValue.serverTimestamp()
             });
         } catch (dbErr) {
-            console.error("[SKQ] Firestore save FAILED:", dbErr);
+            console.error("[SKQ Teacher Custom] Result of Firebase write operation: FAILED -", dbErr);
             hideLoading();
             showToast("⚠️ Failed to save competition to database. Check console.");
             return;
         }
     } else {
-        console.warn("[SKQ] Firestore (db) not available — running in local-only mode.");
+        console.warn("[SKQ Teacher Custom] Firestore (db) not available — running in local-only mode.");
     }
 
     // Multi-tab synchronization broadcast
