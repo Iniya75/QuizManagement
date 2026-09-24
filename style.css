@@ -2966,6 +2966,51 @@ body.dark .tracker-bar-bg {
     color: var(--muted);
 }
 
+/* =====================================================
+   STUDENT LIVE APPLICATION - SCREEN VISIBILITY FIX
+===================================================== */
+.student-live-page {
+    display: none;
+    width: 92%;
+    max-width: 900px;
+    margin: 30px auto;
+}
+
+.student-live-page.active,
+.page.student-live-page.active {
+    display: block !important;
+}
+
+.student-join-screen {
+    display: none;
+}
+
+.student-join-screen.active,
+.auth-page.student-join-screen.active {
+    display: flex !important;
+}
+
+.student-quiz-meta-header {
+    text-align: center;
+    margin-bottom: 14px;
+}
+
+.student-quiz-meta-header h3 {
+    font-size: 1.4rem;
+    font-weight: 800;
+    color: var(--primary);
+    margin: 0 0 4px 0;
+}
+
+.student-score-tag {
+    background: rgba(124, 58, 237, 0.12);
+    color: var(--primary);
+    font-weight: 800;
+    padding: 6px 14px;
+    border-radius: 12px;
+    font-size: 0.95rem;
+}
+
 /* --- Student Waiting View --- */
 .student-waiting-container {
     max-width: 600px;

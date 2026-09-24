@@ -4646,11 +4646,16 @@ function openStudentJoinPage() {
 
     // Auto-fill student name if logged in
     const nameInput = document.getElementById("sJoinNameInput");
-    if (nameInput && !nameInput.value) {
-        if (userData && userData.name) {
-            nameInput.value = userData.name;
-        } else if (currentUser && currentUser.displayName) {
-            nameInput.value = currentUser.displayName;
+    if (nameInput) {
+        if (!nameInput.value) {
+            if (userData && userData.name) {
+                nameInput.value = userData.name;
+            } else if (currentUser && currentUser.displayName) {
+                nameInput.value = currentUser.displayName;
+            }
+        }
+        if (nameInput.value) {
+            updateStudentLivePlayerName(nameInput.value);
         }
     }
 
@@ -4681,17 +4686,44 @@ function openStudentJoinPage() {
     }
 }
 
+function updateStudentLivePlayerName(name) {
+    const badge = document.getElementById("sLivePlayerNameBadge");
+    if (badge) {
+        const cleanName = (name || "").trim();
+        badge.textContent = cleanName ? `Hi, ${cleanName}` : "Student";
+    }
+}
+
 function showStudentLiveScreen(screenId) {
     document.querySelectorAll(".student-live-page, .student-join-screen").forEach(s => {
         s.classList.add("hidden");
+        s.classList.remove("active");
     });
 
     const target = document.getElementById(screenId);
     if (target) {
         target.classList.remove("hidden");
+        target.classList.add("active");
     }
 
     window.scrollTo(0, 0);
+}
+
+function renderStudentWaitingRoom(comp, studentName) {
+    const title = comp.title || comp.subject || "Live Quiz";
+    const subTitleElem = document.getElementById("sWaitingSubjectTitle");
+    if (subTitleElem) subTitleElem.textContent = title;
+
+    const playerElem = document.getElementById("sWaitingPlayerName");
+    if (playerElem) playerElem.textContent = studentName || "Student";
+
+    const countElem = document.getElementById("sWaitingStudentCount");
+    if (countElem) countElem.textContent = `${comp.participantCount || 1}`;
+
+    const headingElem = document.getElementById("sWaitingStatusHeading");
+    if (headingElem) headingElem.textContent = "Waiting for the host to start the quiz...";
+
+    showStudentLiveScreen("studentWaitingRoom");
 }
 
 function exitStudentLiveQuiz() {
@@ -5083,6 +5115,10 @@ function handleNextQuestionStudent(competition) {
     startStudentQuestionTimer(competition ? (competition.questionDuration || 60) : 60);
 }
 
+function renderStudentQuestion() {
+    renderStudentQuestionView();
+}
+
 function renderStudentQuestionView() {
     if (!currentStudentLiveSession || !currentStudentLiveSession.competition) return;
 
@@ -5094,25 +5130,68 @@ function renderStudentQuestionView() {
     const q = normalizeLiveQuestion(rawQ);
 
     const totalQ = comp.totalQuestions || questions.length;
-    document.getElementById("sLiveQBadge").textContent = `Question ${qIdx + 1} of ${totalQ}`;
-    document.getElementById("sLiveQuestionText").textContent = q.question;
 
-    document.getElementById("sOptTextA").textContent = q.options[0] || "";
-    document.getElementById("sOptTextB").textContent = q.options[1] || "";
-    document.getElementById("sOptTextC").textContent = q.options[2] || "";
-    document.getElementById("sOptTextD").textContent = q.options[3] || "";
+    // Quiz Title & Subject
+    const titleElem = document.getElementById("sLiveQuizTitle");
+    if (titleElem) titleElem.textContent = comp.title || comp.subject || "Live Quiz";
+    const subElem = document.getElementById("sLiveSubjectBadge");
+    if (subElem) subElem.textContent = comp.subject || "Live Competition";
 
-    // Reset button states: enable, clear all highlight classes
-    document.querySelectorAll(".student-option-btn").forEach(btn => {
-        btn.disabled = false;
-        btn.classList.remove("selected-option", "is-correct-answer", "is-wrong-answer");
-    });
+    // Score & Question counter
+    const scoreBadge = document.getElementById("sLiveScoreBadge");
+    if (scoreBadge) scoreBadge.textContent = `Score: ${(currentStudentLiveSession.score || 0).toLocaleString()} pts`;
+
+    const qBadge = document.getElementById("sLiveQBadge");
+    if (qBadge) qBadge.textContent = `Question ${qIdx + 1} of ${totalQ}`;
+
+    const qText = document.getElementById("sLiveQuestionText");
+    if (qText) qText.textContent = q.question;
+
+    renderAnswerOptions(q.options, -1, false);
+
+    const promptElem = document.getElementById("sLiveSelectPrompt");
+    if (promptElem) promptElem.textContent = "Select one answer";
 
     const feedback = document.getElementById("sAnswerFeedback");
     if (feedback) {
         feedback.className = "student-feedback-box hidden";
         feedback.classList.add("hidden");
     }
+}
+
+function renderAnswerOptions(options, selectedIndex = -1, isSubmitted = false) {
+    const opts = options || [];
+    const optIds = ["sOptTextA", "sOptTextB", "sOptTextC", "sOptTextD"];
+    optIds.forEach((id, idx) => {
+        const elem = document.getElementById(id);
+        if (elem) elem.textContent = opts[idx] || "";
+    });
+
+    document.querySelectorAll(".student-option-btn").forEach((btn, idx) => {
+        btn.disabled = isSubmitted;
+        btn.classList.remove("selected-option", "is-correct-answer", "is-wrong-answer");
+        if (selectedIndex === idx) {
+            btn.classList.add("selected-option");
+        }
+    });
+}
+
+function handleStudentAnswer(optionIndex) {
+    submitStudentLiveAnswer(optionIndex);
+}
+
+function showAnswerFeedback(lastAnswer, qIdx) {
+    showStudentInstantFeedback(lastAnswer, qIdx);
+}
+
+function renderStudentFinishedScreen() {
+    if (currentStudentLiveSession && currentStudentLiveSession.code) {
+        loadStudentFinalPodiumAndLeaderboard(currentStudentLiveSession.code);
+    }
+}
+
+function renderStudentLeaderboard(participants) {
+    handleShowLeaderboardStudent({ leaderboard: participants });
 }
 
 function startStudentQuestionTimer(duration = 60) {
@@ -5204,6 +5283,13 @@ function submitStudentLiveAnswer(optionIndex) {
     });
     console.log("[SKQ Student] Answer correctness:", isCorrect);
     console.log("[SKQ Student] Score updated:", currentStudentLiveSession.score);
+
+    // Update score badge and prompt text
+    const scoreBadge = document.getElementById("sLiveScoreBadge");
+    if (scoreBadge) scoreBadge.textContent = `Score: ${(currentStudentLiveSession.score || 0).toLocaleString()} pts`;
+
+    const promptElem = document.getElementById("sLiveSelectPrompt");
+    if (promptElem) promptElem.textContent = "Answer submitted — waiting for host...";
 
     // Display INSTANT feedback on student's screen
     showStudentInstantFeedback(currentStudentLiveSession.lastAnswer, qIdx);
