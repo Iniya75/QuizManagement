@@ -3460,55 +3460,88 @@ async function launchCompetitionLobby() {
     const code = generateCompetitionCode();
     const count = generatedCompetitionQuestions.length;
     const createdAtISO = new Date().toISOString();
+    const expiresAtISO = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
     const sanitizedQuestions = sanitizeQuestionsForFirestore(generatedCompetitionQuestions);
+    const creatorName = currentTeacher ? (currentTeacher.name || currentTeacher.email || currentTeacher.teacherId || "Prof. Educator") : "Staff";
 
-    showLoading("Creating Competition Room...");
+    if (sanitizedQuestions.length === 0) {
+        showToast("⚠️ Please select questions before launching competition.");
+        return;
+    }
 
-    // In-memory object — uses ISO string (safe for JSON/localStorage)
+    showLoading("Creating & Saving Competition Room...");
+
     const competitionData = {
-        code: code,
         competitionCode: code,
+        code: code,
+        competitionType: "auto",
+        createdBy: creatorName,
         teacherId: currentTeacher ? (currentTeacher.teacherId || currentTeacher.uid || "TEACHER-01") : "TEACHER-01",
-        teacherName: currentTeacher ? currentTeacher.name : "Professor",
+        teacherName: currentTeacher ? currentTeacher.name : creatorName,
         subject: subject,
-        totalQuestions: count,
-        questions: sanitizedQuestions,
         status: "waiting",
+        temporaryQuestions: sanitizedQuestions,
+        questions: sanitizedQuestions,
+        totalQuestions: count,
         currentQuestionIndex: 0,
         questionStartTime: null,
         questionDuration: 60,
         participantCount: 0,
         participants: {},
         answersSummary: {},
-        createdAt: createdAtISO
+        isStaffCreated: false,
+        createdAt: createdAtISO,
+        expiresAt: expiresAtISO
     };
 
-    activeHostCompetition = competitionData;
-    // Safe to serialize — no serverTimestamp sentinels in object
-    try { localStorage.setItem("skillquest_active_competition", JSON.stringify(activeHostCompetition)); } catch(e) {}
-
-    // Save to Firestore — use serverTimestamp only in the Firestore payload
-    if (typeof db !== "undefined") {
-        try {
-            console.log("[SKQ Teacher] Generated competition code:", code);
-            console.log("[SKQ Teacher] Firebase collection name: liveCompetitions");
-            console.log("[SKQ Teacher] Firebase document ID:", code);
-            console.log("[SKQ Teacher] Saved competition fields:", Object.keys(competitionData));
-            console.log("[SKQ Teacher] Saving competition to Firestore:", code, "collection: liveCompetitions");
-            await db.collection("liveCompetitions").doc(code).set({
-                ...competitionData,
-                createdAt: firebase.firestore.FieldValue.serverTimestamp()
-            });
-            console.log("[SKQ Teacher] Result of Firebase write operation: SUCCESS (Doc ID:", code, ")");
-        } catch (dbErr) {
-            console.error("[SKQ Teacher] Result of Firebase write operation: FAILED -", dbErr);
-            hideLoading();
-            showToast("⚠️ Failed to save competition to database. Check console.");
-            return;
-        }
-    } else {
-        console.warn("[SKQ Teacher] Firestore (db) not available — running in local-only mode.");
+    // Strict Firestore verification: Verify db is available
+    if (typeof db === "undefined" || !db) {
+        hideLoading();
+        console.error("[SKQ Teacher] Firestore database instance (db) is not initialized!");
+        alert("⚠️ Database connection error: Firestore is not initialized. Please refresh the page and ensure your internet connection is active.");
+        return;
     }
+
+    // Save to Firestore and confirm write succeeded
+    try {
+        const firestorePayload = {
+            ...competitionData,
+            createdAt: firebase.firestore.FieldValue.serverTimestamp()
+        };
+
+        console.log("[SKQ Teacher] Saving competition document to Firestore:", {
+            competitionCode: code,
+            documentId: code,
+            collection: "liveCompetitions",
+            status: "saving"
+        });
+
+        await db.collection("liveCompetitions").doc(code).set(firestorePayload);
+
+        // Verify document was actually written to Firestore
+        const verifySnap = await db.collection("liveCompetitions").doc(code).get();
+        if (!verifySnap.exists) {
+            throw new Error(`Document verification failed: Room "${code}" was not found in Firestore after write operation.`);
+        }
+
+        // Safe debugging log
+        console.log({
+            competitionCode: code,
+            documentId: code,
+            collection: "liveCompetitions",
+            status: "saved"
+        });
+
+    } catch (dbErr) {
+        console.error("[SKQ Teacher] Firestore write FAILED:", dbErr);
+        hideLoading();
+        alert(`⚠️ Failed to save competition room to database: ${dbErr.message || dbErr}. Please try again.`);
+        return;
+    }
+
+    // ONLY after Firestore write is confirmed: Set active competition in memory
+    activeHostCompetition = competitionData;
+    try { localStorage.setItem("skillquest_active_competition", JSON.stringify(activeHostCompetition)); } catch(e) {}
 
     // Broadcast setup for multi-tab/same-device synchronization
     setupBroadcastChannel(code);
@@ -3516,10 +3549,10 @@ async function launchCompetitionLobby() {
 
     hideLoading();
 
-    // Render Waiting Room UI
+    // Render Waiting Room UI & QR Code ONLY after successful database write
     setupTeacherWaitingRoomUI(competitionData);
     showTeacherPage("teacherWaitingRoom");
-    showToast(`🎉 Room Created! Join Code: ${code}`);
+    showToast(`🎉 Room Created & Saved! Join Code: ${code}`);
 
     // Listen for participants joining via Firestore
     attachHostCompetitionListeners(code);
@@ -3595,7 +3628,11 @@ function cancelCompetition() {
     if (activeHostCompetition) {
         broadcastLiveEvent({ type: "COMPETITION_CANCELLED", code: activeHostCompetition.code });
         if (typeof db !== "undefined") {
-            db.collection("liveCompetitions").doc(activeHostCompetition.code).update({ status: "cancelled" }).catch(() => {});
+            db.collection("liveCompetitions").doc(activeHostCompetition.code).update({
+                status: "cancelled",
+                temporaryQuestions: firebase.firestore.FieldValue.delete(),
+                questions: firebase.firestore.FieldValue.delete()
+            }).catch(() => {});
         }
         cleanupActiveHostListeners();
         activeHostCompetition = null;
@@ -4196,7 +4233,9 @@ function showFinalPodiumHost() {
         batch.commit().catch(e => console.warn("[SKQ Host] Final score sync notice:", e));
 
         db.collection("liveCompetitions").doc(activeHostCompetition.code).update({
-            status: "completed"
+            status: "completed",
+            temporaryQuestions: firebase.firestore.FieldValue.delete(),
+            questions: firebase.firestore.FieldValue.delete()
         }).catch(e => console.warn("[SKQ Host] Firestore completed update notice:", e));
     }
 
@@ -4252,7 +4291,9 @@ async function saveAndFinishCompetition() {
                 timestamp: firebase.firestore.FieldValue.serverTimestamp()
             });
             await db.collection("liveCompetitions").doc(activeHostCompetition.code).update({
-                status: "completed"
+                status: "completed",
+                temporaryQuestions: firebase.firestore.FieldValue.delete(),
+                questions: firebase.firestore.FieldValue.delete()
             });
         } catch (dbErr) {
             console.warn("Firestore history save notice:", dbErr);
@@ -4580,6 +4621,19 @@ async function joinLiveCompetition() {
             return;
         }
 
+        if (competitionData.expiresAt && new Date(competitionData.expiresAt) < new Date()) {
+            hideLoading();
+            errElem.textContent = `This competition room has expired.`;
+            return;
+        }
+
+        // Ensure questions array is populated from temporaryQuestions if needed
+        if (!competitionData.questions || competitionData.questions.length === 0) {
+            if (competitionData.temporaryQuestions && competitionData.temporaryQuestions.length > 0) {
+                competitionData.questions = competitionData.temporaryQuestions;
+            }
+        }
+
         // Generate unique student participant ID
         const studentId = currentUser ? currentUser.uid : `s_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
         const participantObj = {
@@ -4591,7 +4645,7 @@ async function joinLiveCompetition() {
 
         currentStudentLiveSession = {
             code: competitionDocId,   // Use the actual Firestore doc ID
-            codeDisplay: codeInput,   // The code the student typed/scanned
+            codeDisplay: normalizedCode,   // The code the student typed/scanned
             studentId: studentId,
             studentName: nameInput,
             score: 0,
@@ -5365,19 +5419,24 @@ async function publishStaffCreatedQuiz() {
     const code = generateCompetitionCode();
     const count = sanitizedQuestions.length;
     const createdAtISO = new Date().toISOString();
+    const expiresAtISO = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    const creatorName = currentTeacher ? (currentTeacher.name || currentTeacher.email || currentTeacher.teacherId || "Prof. Educator") : "Staff";
 
-    showLoading("Publishing Custom Quiz & Generating Room...");
+    showLoading("Creating & Saving Custom Quiz to Database...");
 
     const competitionData = {
-        code: code,
         competitionCode: code,
-        title: title,
+        code: code,
+        competitionType: "custom",
+        createdBy: creatorName,
         teacherId: currentTeacher ? (currentTeacher.teacherId || currentTeacher.uid || "TEACHER-01") : "TEACHER-01",
-        teacherName: currentTeacher ? currentTeacher.name : "Professor",
+        teacherName: currentTeacher ? currentTeacher.name : creatorName,
+        title: title,
         subject: `${title}`,
-        totalQuestions: count,
-        questions: sanitizedQuestions,
         status: "waiting",
+        temporaryQuestions: sanitizedQuestions,
+        questions: sanitizedQuestions,
+        totalQuestions: count,
         currentQuestionIndex: 0,
         questionStartTime: null,
         questionDuration: duration,
@@ -5385,45 +5444,58 @@ async function publishStaffCreatedQuiz() {
         participants: {},
         answersSummary: {},
         isStaffCreated: true,
-        createdAt: createdAtISO
+        createdAt: createdAtISO,
+        expiresAt: expiresAtISO
     };
 
+    // Strict Firestore verification: Verify db is available
+    if (typeof db === "undefined" || !db) {
+        hideLoading();
+        console.error("[SKQ Teacher Custom] Firestore database instance (db) is not initialized!");
+        alert("⚠️ Database connection error: Firestore is not initialized. Please refresh the page and ensure your internet connection is active.");
+        return;
+    }
+
+    // Save to Firestore and confirm write succeeded
+    try {
+        const firestorePayload = {
+            ...competitionData,
+            createdAt: firebase.firestore.FieldValue.serverTimestamp()
+        };
+
+        console.log("[SKQ Teacher Custom] Saving custom competition document to Firestore:", {
+            competitionCode: code,
+            documentId: code,
+            collection: "liveCompetitions",
+            status: "saving"
+        });
+
+        await db.collection("liveCompetitions").doc(code).set(firestorePayload);
+
+        // Verify document was actually written to Firestore
+        const verifySnap = await db.collection("liveCompetitions").doc(code).get();
+        if (!verifySnap.exists) {
+            throw new Error(`Document verification failed: Room "${code}" was not found in Firestore after write operation.`);
+        }
+
+        // Safe debugging log required by user
+        console.log({
+            competitionCode: code,
+            documentId: code,
+            collection: "liveCompetitions",
+            status: "saved"
+        });
+
+    } catch (dbErr) {
+        console.error("[SKQ Teacher Custom] Firestore write FAILED:", dbErr);
+        hideLoading();
+        alert(`⚠️ Failed to save competition to database: ${dbErr.message || dbErr}. Please try again.`);
+        return; // Do NOT generate QR code or show waiting room if unsaved!
+    }
+
+    // ONLY after Firestore write is confirmed: Set active competition in memory
     activeHostCompetition = competitionData;
     try { localStorage.setItem("skillquest_active_competition", JSON.stringify(activeHostCompetition)); } catch(e) {}
-
-    // Save to Firestore — serverTimestamp only in Firestore payload
-    if (typeof db !== "undefined") {
-        try {
-            console.log("[SKQ Teacher Custom] Generated competition code:", code);
-            console.log("[SKQ Teacher Custom] Firebase collection name: liveCompetitions");
-            console.log("[SKQ Teacher Custom] Firebase document ID:", code);
-            console.log("[SKQ Teacher Custom] Saved competition fields:", Object.keys(competitionData));
-            console.log("[SKQ Teacher Custom] Saving staff quiz competition to Firestore:", code, "collection: liveCompetitions");
-            await db.collection("liveCompetitions").doc(code).set({
-                ...competitionData,
-                createdAt: firebase.firestore.FieldValue.serverTimestamp()
-            });
-            console.log("[SKQ Teacher Custom] Result of Firebase write operation: SUCCESS (Doc ID:", code, ")");
-
-            await db.collection("staffQuizzes").add({
-                title: title,
-                subject: subject,
-                teacherId: competitionData.teacherId,
-                teacherName: competitionData.teacherName,
-                totalQuestions: count,
-                questions: sanitizedQuestions,
-                questionDuration: duration,
-                createdAt: firebase.firestore.FieldValue.serverTimestamp()
-            });
-        } catch (dbErr) {
-            console.error("[SKQ Teacher Custom] Result of Firebase write operation: FAILED -", dbErr);
-            hideLoading();
-            showToast("⚠️ Failed to save competition to database. Check console.");
-            return;
-        }
-    } else {
-        console.warn("[SKQ Teacher Custom] Firestore (db) not available — running in local-only mode.");
-    }
 
     // Multi-tab synchronization broadcast
     setupBroadcastChannel(code);
@@ -5431,10 +5503,10 @@ async function publishStaffCreatedQuiz() {
 
     hideLoading();
 
-    // Render Waiting Room UI & QR Code
+    // Render Waiting Room UI & QR Code ONLY after successful database write
     setupTeacherWaitingRoomUI(competitionData);
     showTeacherPage("teacherWaitingRoom");
-    showToast(`🎉 Quiz Published! Join Code: ${code}`);
+    showToast(`🎉 Room Created & Saved! Join Code: ${code}`);
 
     // Listen for live participants
     attachHostCompetitionListeners(code);
