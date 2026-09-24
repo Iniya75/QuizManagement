@@ -3580,12 +3580,51 @@ function setupTeacherWaitingRoomUI(comp) {
     }
 }
 
+function getLiveCompetitionJoinUrl(code) {
+    const defaultPagesBase = "https://iniya75.github.io/QuizManagement/";
+    let baseUrl = defaultPagesBase;
+
+    try {
+        if (typeof window !== "undefined" && window.location) {
+            const host = window.location.hostname;
+            if (host === "iniya75.github.io") {
+                let pathname = window.location.pathname;
+                if (!pathname.endsWith("/")) {
+                    const lastSlash = pathname.lastIndexOf("/");
+                    pathname = lastSlash >= 0 ? pathname.substring(0, lastSlash + 1) : "/";
+                }
+                baseUrl = `${window.location.origin}${pathname}`;
+            } else if (host === "localhost" || host === "127.0.0.1" || window.location.protocol === "file:") {
+                // When running locally, use public GitHub Pages URL so scanning on phones works!
+                baseUrl = defaultPagesBase;
+            } else {
+                let pathname = window.location.pathname;
+                if (!pathname.endsWith("/")) {
+                    const lastSlash = pathname.lastIndexOf("/");
+                    pathname = lastSlash >= 0 ? pathname.substring(0, lastSlash + 1) : "/";
+                }
+                baseUrl = `${window.location.origin}${pathname}`;
+            }
+        }
+    } catch (e) {
+        baseUrl = defaultPagesBase;
+    }
+
+    if (!baseUrl.endsWith("/")) {
+        baseUrl += "/";
+    }
+
+    const fullJoinUrl = `${baseUrl}?join=${encodeURIComponent(code)}`;
+    console.log("[SKQ Host] Generated public QR join URL:", fullJoinUrl);
+    return fullJoinUrl;
+}
+
 function renderHostQrCode(code) {
     const qrContainer = document.getElementById("teacherQrCode");
     if (!qrContainer) return;
     qrContainer.innerHTML = "";
 
-    const joinUrl = `${window.location.origin}${window.location.pathname}?join=${encodeURIComponent(code)}`;
+    const joinUrl = getLiveCompetitionJoinUrl(code);
 
     try {
         if (typeof QRCode !== "undefined") {
@@ -3616,7 +3655,7 @@ function copyCompetitionCode() {
 
 function copyCompetitionLink() {
     if (!activeHostCompetition) return;
-    const joinUrl = `${window.location.origin}${window.location.pathname}?join=${encodeURIComponent(activeHostCompetition.code)}`;
+    const joinUrl = getLiveCompetitionJoinUrl(activeHostCompetition.code);
     navigator.clipboard.writeText(joinUrl)
         .then(() => showToast("🔗 Copied direct join link to clipboard!"))
         .catch(() => alert(joinUrl));
@@ -4452,6 +4491,7 @@ function openStudentJoinPage() {
     const urlParams = new URLSearchParams(window.location.search);
     const joinCode = urlParams.get("join");
     if (joinCode) {
+        console.log("[SKQ Student] Student join code detected from URL:", joinCode);
         const codeInput = document.getElementById("sJoinCodeInput");
         if (codeInput) {
             codeInput.value = joinCode.toUpperCase();
@@ -4614,6 +4654,8 @@ async function joinLiveCompetition() {
         }
 
         console.log("[SKQ Student] Competition found:", competitionDocId, "| Subject:", competitionData.subject, "| Status:", competitionData.status);
+        console.log("[SKQ Student] Firestore room loaded:", competitionDocId);
+        console.log("[SKQ Student] Number of questions loaded:", competitionData.questions ? competitionData.questions.length : 0);
 
         if (competitionData.status === "completed" || competitionData.status === "cancelled") {
             hideLoading();
@@ -4871,6 +4913,9 @@ function submitStudentLiveAnswer(optionIndex) {
     if (isCorrect) {
         const speedBonus = Math.round(500 * (liveTimeRemaining / 60));
         pointsAwarded = 1000 + speedBonus;
+        currentStudentLiveSession.correctCount = (currentStudentLiveSession.correctCount || 0) + 1;
+    } else {
+        currentStudentLiveSession.wrongCount = (currentStudentLiveSession.wrongCount || 0) + 1;
     }
 
     currentStudentLiveSession.score = (currentStudentLiveSession.score || 0) + pointsAwarded;
@@ -5029,6 +5074,47 @@ function handleShowPodiumStudent(event) {
 
     createConfetti();
     showStudentLiveScreen("studentPodium");
+
+    // Save student result to competitionResults collection
+    if (typeof db !== "undefined" && currentStudentLiveSession && !currentStudentLiveSession._resultSaved) {
+        currentStudentLiveSession._resultSaved = true;
+        const comp = currentStudentLiveSession.competition;
+        const totalQ = comp ? (comp.totalQuestions || (comp.questions && comp.questions.length) || 1) : 1;
+        const correctAnswers = currentStudentLiveSession.correctCount || 0;
+        const wrongAnswers = currentStudentLiveSession.wrongCount || 0;
+        const unanswered = Math.max(0, totalQ - (correctAnswers + wrongAnswers));
+        const percentage = Math.round((correctAnswers / totalQ) * 100);
+
+        console.log("[SKQ Student] Final score calculated:", {
+            totalQuestions: totalQ,
+            correctAnswers: correctAnswers,
+            wrongAnswers: wrongAnswers,
+            unanswered: unanswered,
+            finalScore: myScore,
+            percentage: percentage
+        });
+
+        db.collection("competitionResults").add({
+            competitionCode: currentStudentLiveSession.code,
+            studentId: currentStudentLiveSession.studentId,
+            studentName: currentStudentLiveSession.studentName,
+            finalScore: myScore,
+            rank: myRank,
+            totalQuestions: totalQ,
+            correctAnswers: correctAnswers,
+            wrongAnswers: wrongAnswers,
+            unanswered: unanswered,
+            percentage: percentage,
+            submittedAt: firebase.firestore.FieldValue.serverTimestamp()
+        }).then(docRef => {
+            console.log("[SKQ Student] Result saved to competitionResults:", {
+                competitionCode: currentStudentLiveSession.code,
+                documentId: docRef.id,
+                collection: "competitionResults",
+                status: "saved"
+            });
+        }).catch(err => console.warn("[SKQ Student] competitionResults save notice:", err));
+    }
 }
 
 /* =====================================================

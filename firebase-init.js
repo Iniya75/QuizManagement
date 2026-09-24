@@ -1,4 +1,4 @@
-// Firebase Initialization
+// Firebase Initialization & Configuration
 const firebaseConfig = {
   apiKey: "AIzaSyDUUsHQVjJUI4TU4hbNNoO0x3AM9UEOHyU",
   authDomain: "quizquest-3d82a.firebaseapp.com",
@@ -9,10 +9,25 @@ const firebaseConfig = {
   measurementId: "G-FRCW084FTV"
 };
 
-// Initialize Firebase App
-if (!firebase.apps.length) {
-  firebase.initializeApp(firebaseConfig);
+// Initialize Firebase App safely with validation
+if (typeof firebase !== "undefined") {
+  try {
+    if (!firebase.apps.length) {
+      firebase.initializeApp(firebaseConfig);
+    }
+    console.log("[SKQ Firebase] Firebase initialized successfully for project:", firebaseConfig.projectId);
+  } catch (initErr) {
+    console.error("[SKQ Firebase] Error during Firebase initialization:", initErr);
+  }
+} else {
+  console.error("[SKQ Firebase] CRITICAL: Firebase SDK is not loaded. Check script tags in index.html.");
 }
 
-const auth = firebase.auth();
-const db = firebase.firestore();
+const auth = (typeof firebase !== "undefined" && typeof firebase.auth === "function") ? firebase.auth() : null;
+const db = (typeof firebase !== "undefined" && typeof firebase.firestore === "function") ? firebase.firestore() : null;
+
+if (db) {
+  console.log("[SKQ Firebase] Firestore database instance (db) is ready.");
+} else {
+  console.error("[SKQ Firebase] Firestore database instance (db) failed to initialize.");
+}
