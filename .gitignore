@@ -1,5 +1,13 @@
+
+# Environment variables
 .env
-.env.local
+.env.*
+!.env.example
+
+# Dependencies and build files
 node_modules/
 dist/
+
+# OS files
 .DS_Store
+Thumbs.db
