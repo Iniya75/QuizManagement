@@ -11,3 +11,6 @@ dist/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Local Firebase configuration
+firebase-init.js
